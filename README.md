@@ -6,11 +6,51 @@ This project was bootstrapped by [Emergent](https://emergent.sh).
 
 ### Required env vars (backend)
 ```
+JWT_SECRET=...
+BOT_SECRET_KEY=...
 STRIPE_SECRET_KEY=sk_test_...
 STRIPE_PUBLISHABLE_KEY=pk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 REDIS_URL=redis://redis:6379/0
+CORS_ORIGINS=https://your-frontend.com
+ALLOWED_ORIGINS=https://your-frontend.com
 ```
+
+### Auth & Security Notes
+- Auth uses httpOnly cookies + CSRF tokens. Clients should call `/api/auth/csrf` once on boot.
+- Admin bootstrap is locked by default:
+  - Set `ADMIN_BOOTSTRAP_TOKEN` and pass it as `X-Admin-Bootstrap` header on first registration, or
+  - Temporarily set `ALLOW_BOOTSTRAP_ADMIN=true` and remove after first admin is created.
+- CORS must be explicit; wildcard is not supported with credentials.
+
+### Optional Security/Abuse Controls
+```
+COOKIE_SECURE=true
+COOKIE_SAMESITE=lax
+COOKIE_DOMAIN=yourdomain.com
+MAX_MESSAGE_LENGTH=2000
+BLOCKED_TERMS=term1,term2
+RATE_LIMIT_MESSAGES_PER_MIN=30
+RATE_LIMIT_BOT_MESSAGES_PER_MIN=60
+RATE_LIMIT_HEARTBEAT_PER_MIN=60
+RATE_LIMIT_HANDSHAKE_PER_MIN=10
+RATE_LIMIT_REFRESH_PER_MIN=5
+DUPLICATE_WINDOW_SECONDS=120
+DUPLICATE_THRESHOLD=3
+ALERT_MODERATION_THRESHOLD=5
+```
+
+### Admin Ops Endpoints
+- Moderation queue:
+  - `GET /api/admin/moderation`
+  - `POST /api/admin/moderation/{item_id}/resolve`
+  - `POST /api/admin/moderation/{item_id}/shadow-ban`
+  - `POST /api/admin/moderation/{item_id}/ban`
+- Abuse telemetry:
+  - `GET /api/admin/rate-limits`
+  - `GET /api/admin/alerts`
+- Lookups for Ops UI:
+  - `GET /api/admin/lookups`
 
 ### Docker Compose snippet (Redis + ARQ worker)
 ```yaml

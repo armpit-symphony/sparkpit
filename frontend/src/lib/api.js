@@ -5,6 +5,7 @@ export const API_BASE = `${BACKEND_URL}/api`;
 
 export const api = axios.create({
   baseURL: API_BASE,
+  withCredentials: true,
 });
 
 export const setAuthToken = (token) => {
@@ -12,6 +13,14 @@ export const setAuthToken = (token) => {
     api.defaults.headers.common.Authorization = `Bearer ${token}`;
   } else {
     delete api.defaults.headers.common.Authorization;
+  }
+};
+
+export const setCsrfToken = (token) => {
+  if (token) {
+    api.defaults.headers.common["X-CSRF-Token"] = token;
+  } else {
+    delete api.defaults.headers.common["X-CSRF-Token"];
   }
 };
 

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -7,6 +7,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+from urllib.parse import urlparse
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timezone, timedelta
@@ -17,6 +18,7 @@ from cryptography.fernet import Fernet
 import os
 import uuid
 import logging
+import json
 import base64
 import hashlib
 import hmac
@@ -32,11 +34,17 @@ mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "sparkpit_dev_secret")
+JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 BOT_TOKEN_EXPIRE_DAYS = 30
-BOT_SECRET_KEY = os.environ.get("BOT_SECRET_KEY", JWT_SECRET)
+BOT_REFRESH_TOKEN_DAYS = 60
+BOT_SECRET_KEY = os.environ.get("BOT_SECRET_KEY")
+
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET must be set")
+if not BOT_SECRET_KEY:
+    raise RuntimeError("BOT_SECRET_KEY must be set")
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
@@ -59,7 +67,7 @@ ACTIVITY_EVENTS = [
 ]
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -75,6 +83,8 @@ def now_iso() -> str:
 def new_id() -> str:
     return str(uuid.uuid4())
 
+def now_epoch() -> int:
+    return int(time.time())
 
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
@@ -86,13 +96,13 @@ def verify_password(password: str, hashed: str) -> bool:
 
 def create_token(user: Dict[str, Any]) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
-    payload = {"sub": user["id"], "exp": expire}
+    payload = {"sub": user["id"], "exp": expire, "iat": now_epoch()}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def create_bot_token(bot_id: str, scopes: Dict[str, List[str]]) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=BOT_TOKEN_EXPIRE_DAYS)
-    payload = {"sub": bot_id, "type": "bot", "scopes": scopes, "exp": expire}
+    payload = {"sub": bot_id, "type": "bot", "scopes": scopes, "exp": expire, "iat": now_epoch(), "jti": new_id()}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
@@ -111,6 +121,220 @@ def decrypt_secret(secret_value: str) -> str:
 
 def generate_bot_secret() -> str:
     return secrets.token_urlsafe(32)
+
+def normalize_terms(raw: str) -> List[str]:
+    return [term.strip().lower() for term in raw.split(",") if term.strip()]
+
+
+def get_blocked_terms() -> List[str]:
+    return normalize_terms(os.environ.get("BLOCKED_TERMS", ""))
+
+
+def get_max_message_length() -> int:
+    try:
+        return int(os.environ.get("MAX_MESSAGE_LENGTH", "2000"))
+    except ValueError:
+        return 2000
+
+
+def get_rate_limit(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def get_duplicate_window_seconds() -> int:
+    return get_rate_limit("DUPLICATE_WINDOW_SECONDS", 120)
+
+
+def get_duplicate_threshold() -> int:
+    return get_rate_limit("DUPLICATE_THRESHOLD", 3)
+
+
+def hash_content(content: str) -> str:
+    normalized = (content or "").strip().lower()
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def truncate_content(content: str, limit: int = 500) -> str:
+    if content is None:
+        return ""
+    return content if len(content) <= limit else content[:limit]
+
+
+async def log_rate_limit_event(
+    actor_type: str,
+    actor_id: str,
+    endpoint: str,
+    detail: str,
+    metadata: Optional[Dict[str, Any]] = None,
+):
+    if not redis_pool:
+        return
+    event = {
+        "actor_type": actor_type,
+        "actor_id": actor_id,
+        "endpoint": endpoint,
+        "detail": detail,
+        "metadata": metadata or {},
+        "created_at": now_iso(),
+    }
+    try:
+        await redis_pool.lpush("rl:events", json.dumps(event))
+        await redis_pool.ltrim("rl:events", 0, 199)
+    except Exception as error:
+        logger.warning("Rate limit event log error: %s", error)
+
+
+def get_shadow_ban_reason() -> str:
+    return os.environ.get("SHADOW_BAN_REASON", "Policy violation")
+
+
+def moderate_text(text: str) -> Optional[str]:
+    if text is None:
+        return None
+    max_len = get_max_message_length()
+    if len(text) > max_len:
+        return f"Content too long (max {max_len} characters)"
+    lowered = text.lower()
+    for term in get_blocked_terms():
+        if term and term in lowered:
+            return "Content violates community rules"
+    return None
+
+
+async def rate_limit(key: str, limit: int, window_seconds: int) -> bool:
+    if not redis_pool:
+        return True
+    try:
+        count = await redis_pool.incr(key)
+        if count == 1:
+            await redis_pool.expire(key, window_seconds)
+        return count <= limit
+    except Exception as error:
+        logger.warning("Rate limit error: %s", error)
+        return True
+
+
+async def detect_duplicate_content(actor_type: str, actor_id: str, content: str) -> bool:
+    if not redis_pool:
+        return False
+    key = f"dup:{actor_type}:{actor_id}:{hash_content(content)}"
+    try:
+        count = await redis_pool.incr(key)
+        if count == 1:
+            await redis_pool.expire(key, get_duplicate_window_seconds())
+        return count > get_duplicate_threshold()
+    except Exception as error:
+        logger.warning("Duplicate detection error: %s", error)
+        return False
+
+
+async def log_moderation_event(
+    actor_type: str,
+    actor_id: str,
+    content_type: str,
+    content: str,
+    reason: str,
+    action: str = "rejected",
+    metadata: Optional[Dict[str, Any]] = None,
+):
+    doc = {
+        "id": new_id(),
+        "actor_type": actor_type,
+        "actor_id": actor_id,
+        "content_type": content_type,
+        "content": truncate_content(content),
+        "reason": reason,
+        "action": action,
+        "status": "queued",
+        "metadata": metadata or {},
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.moderation_queue.insert_one(doc)
+
+
+async def should_alert_on_moderation(actor_type: str, actor_id: str) -> bool:
+    recent_window = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    recent = await db.moderation_queue.count_documents({
+        "actor_type": actor_type,
+        "actor_id": actor_id,
+        "created_at": {"$gte": recent_window},
+    })
+    return recent >= get_rate_limit("ALERT_MODERATION_THRESHOLD", 5)
+
+
+async def log_alert_event(event_type: str, payload: Dict[str, Any]):
+    doc = {
+        "id": new_id(),
+        "event_type": event_type,
+        "payload": payload,
+        "created_at": now_iso(),
+    }
+    await db.alert_events.insert_one(doc)
+
+
+def clamp_score(value: int) -> int:
+    return max(0, min(100, value))
+
+
+async def compute_user_trust(user_id: str) -> Dict[str, Any]:
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        return {"score": 0, "signals": {}}
+    created_at = user.get("created_at")
+    age_days = 0
+    if created_at:
+        try:
+            created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - created_dt).days
+        except Exception:
+            age_days = 0
+    messages_sent = await db.messages.count_documents({"sender_type": "user", "sender_id": user_id})
+    moderation_count = await db.moderation_queue.count_documents({"actor_type": "user", "actor_id": user_id})
+    score = 50
+    score += min(age_days // 10, 20)
+    score += min(messages_sent // 50, 10)
+    score -= moderation_count * 10
+    return {
+        "score": clamp_score(score),
+        "signals": {
+            "age_days": age_days,
+            "messages_sent": messages_sent,
+            "moderation_flags": moderation_count,
+        },
+    }
+
+
+async def compute_bot_trust(bot_id: str) -> Dict[str, Any]:
+    bot = await db.bots.find_one({"id": bot_id})
+    if not bot:
+        return {"score": 0, "signals": {}}
+    messages_sent = await db.messages.count_documents({"sender_type": "bot", "sender_id": bot_id})
+    moderation_count = await db.moderation_queue.count_documents({"actor_type": "bot", "actor_id": bot_id})
+    handshake_verified = 1 if bot.get("handshake_verified_at") else 0
+    score = 50
+    score += 10 if handshake_verified else 0
+    score += min(messages_sent // 100, 10)
+    score -= moderation_count * 10
+    return {
+        "score": clamp_score(score),
+        "signals": {
+            "messages_sent": messages_sent,
+            "handshake_verified": bool(handshake_verified),
+            "moderation_flags": moderation_count,
+        },
+    }
+
+
+def hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def new_refresh_token() -> str:
+    return secrets.token_urlsafe(48)
 
 
 def sanitize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -211,7 +435,7 @@ async def activate_membership(user_id: str, session_id: str, customer_id: Option
 
 
 class AuthResponse(BaseModel):
-    token: str
+    token: Optional[str] = None
     user: Dict[str, Any]
 
 
@@ -305,14 +529,43 @@ class BotHandshakeVerify(BaseModel):
     allowed_room_ids: List[str] = []
     allowed_channel_ids: List[str] = []
 
+class BotTokenRefresh(BaseModel):
+    refresh_token: str
+
+
+class ModerationResolve(BaseModel):
+    status: str
+    notes: Optional[str] = None
+
+
+async def issue_bot_tokens(bot_id: str, scopes: Dict[str, List[str]]) -> Dict[str, Any]:
+    bot_token = create_bot_token(bot_id, scopes)
+    refresh_token = new_refresh_token()
+    expires_at = now_epoch() + (BOT_REFRESH_TOKEN_DAYS * 24 * 60 * 60)
+    refresh_doc = {
+        "id": new_id(),
+        "bot_id": bot_id,
+        "token_hash": hash_refresh_token(refresh_token),
+        "expires_at": expires_at,
+        "created_at": now_iso(),
+        "last_used_at": None,
+    }
+    await db.bot_refresh_tokens.insert_one(refresh_doc)
+    return {"bot_token": bot_token, "refresh_token": refresh_token, "expires_in_days": BOT_TOKEN_EXPIRE_DAYS}
+
 
 class BotMessageCreate(BaseModel):
     channel_id: str
     content: str
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
-    token = credentials.credentials
+async def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Dict[str, Any]:
+    token = extract_bearer_token(credentials) or extract_cookie_token(request)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") == "bot":
@@ -323,6 +576,8 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user = await db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    if user.get("is_banned"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account suspended")
     user = sanitize_doc(user)
     user.pop("password_hash", None)
     return user
@@ -340,8 +595,13 @@ async def require_admin(user: Dict[str, Any] = Depends(get_current_user)) -> Dic
     return user
 
 
-async def get_current_bot(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
-    token = credentials.credentials
+async def get_current_bot(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Dict[str, Any]:
+    token = extract_bearer_token(credentials) or extract_cookie_token(request)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except JWTError:
@@ -352,6 +612,12 @@ async def get_current_bot(credentials: HTTPAuthorizationCredentials = Depends(se
     bot = await db.bots.find_one({"id": bot_id})
     if not bot:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bot not found")
+    if bot.get("is_banned"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bot suspended")
+    revoked_at = bot.get("bot_token_revoked_at")
+    token_iat = payload.get("iat")
+    if revoked_at and token_iat and int(token_iat) <= int(revoked_at):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bot token revoked")
     bot = sanitize_doc(bot)
     bot["scopes"] = payload.get("scopes", {})
     return bot
@@ -384,13 +650,31 @@ async def root():
     return {"message": "Spark Pit API online"}
 
 
+@api_router.get("/auth/csrf")
+async def get_csrf():
+    token = get_csrf_token_value()
+    response = JSONResponse(content={"csrf_token": token})
+    csrf_settings = {**get_cookie_settings(), "httponly": False}
+    response.set_cookie("spark_csrf", token, **csrf_settings)
+    return response
+
+
 @api_router.post("/auth/register", response_model=AuthResponse)
-async def register(user: UserCreate):
+async def register(user: UserCreate, request: Request, response: Response):
     existing = await db.users.find_one({"$or": [{"email": user.email}, {"handle": user.handle}]})
     if existing:
         raise HTTPException(status_code=400, detail="Email or handle already exists")
 
     admin_count = await db.users.count_documents({"role": "admin"})
+    if admin_count == 0:
+        bootstrap_token = os.environ.get("ADMIN_BOOTSTRAP_TOKEN")
+        allow_open_bootstrap = os.environ.get("ALLOW_BOOTSTRAP_ADMIN", "").lower() == "true"
+        if bootstrap_token:
+            provided_token = request.headers.get("X-Admin-Bootstrap")
+            if not provided_token or not hmac.compare_digest(bootstrap_token, provided_token):
+                raise HTTPException(status_code=403, detail="Admin bootstrap token required")
+        elif not allow_open_bootstrap:
+            raise HTTPException(status_code=403, detail="Admin bootstrap disabled")
     role = "admin" if admin_count == 0 else "member"
     membership_status = "active" if role == "admin" else "pending"
     now = now_iso()
@@ -419,18 +703,28 @@ async def register(user: UserCreate):
     user_doc = sanitize_doc(user_doc)
     token = create_token(user_doc)
     user_doc.pop("password_hash", None)
-    return {"token": token, "user": user_doc}
+    csrf_token = get_csrf_token_value()
+    set_auth_cookies(response, token, csrf_token)
+    return {"token": None, "user": user_doc}
 
 
 @api_router.post("/auth/login", response_model=AuthResponse)
-async def login(user: UserLogin):
+async def login(user: UserLogin, response: Response):
     existing = await db.users.find_one({"email": user.email})
     if not existing or not verify_password(user.password, existing.get("password_hash", "")):
         raise HTTPException(status_code=400, detail="Invalid credentials")
     existing = sanitize_doc(existing)
     token = create_token(existing)
     existing.pop("password_hash", None)
-    return {"token": token, "user": existing}
+    csrf_token = get_csrf_token_value()
+    set_auth_cookies(response, token, csrf_token)
+    return {"token": None, "user": existing}
+
+
+@api_router.post("/auth/logout")
+async def logout(response: Response):
+    clear_auth_cookies(response)
+    return {"status": "ok"}
 
 
 @api_router.post("/auth/invite/claim")
@@ -459,6 +753,12 @@ async def claim_invite(payload: InviteClaim, user: Dict[str, Any] = Depends(get_
 @api_router.get("/me")
 async def get_me(user: Dict[str, Any] = Depends(get_current_user)):
     return {"user": user}
+
+
+@api_router.get("/me/trust")
+async def get_my_trust(user: Dict[str, Any] = Depends(get_current_user)):
+    trust = await compute_user_trust(user["id"])
+    return trust
 
 
 @api_router.patch("/me")
@@ -502,6 +802,93 @@ async def audit_feed(room_id: Optional[str] = None, admin: Dict[str, Any] = Depe
     return {"items": events}
 
 
+@api_router.get("/admin/moderation")
+async def list_moderation_queue(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    actor_type: Optional[str] = None,
+    content_type: Optional[str] = None,
+    actor_id: Optional[str] = None,
+    room_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    bounty_id: Optional[str] = None,
+    admin: Dict[str, Any] = Depends(require_admin),
+):
+    query: Dict[str, Any] = {}
+    if status_filter:
+        query["status"] = status_filter
+    if actor_type:
+        query["actor_type"] = actor_type
+    if content_type:
+        query["content_type"] = content_type
+    if actor_id:
+        query["actor_id"] = actor_id
+    if room_id:
+        query["metadata.room_id"] = room_id
+    if channel_id:
+        query["metadata.channel_id"] = channel_id
+    if bounty_id:
+        query["metadata.bounty_id"] = bounty_id
+    items = await db.moderation_queue.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return {"items": items}
+
+
+@api_router.post("/admin/moderation/{item_id}/resolve")
+async def resolve_moderation_item(
+    item_id: str,
+    payload: ModerationResolve,
+    admin: Dict[str, Any] = Depends(require_admin),
+):
+    updates = {
+        "status": payload.status,
+        "updated_at": now_iso(),
+        "resolved_by": admin["id"],
+    }
+    if payload.notes:
+        updates["notes"] = payload.notes
+    await db.moderation_queue.update_one({"id": item_id}, {"$set": updates})
+    return {"status": payload.status}
+
+
+@api_router.post("/admin/moderation/{item_id}/ban")
+async def ban_actor_from_moderation(item_id: str, admin: Dict[str, Any] = Depends(require_admin)):
+    item = await db.moderation_queue.find_one({"id": item_id})
+    if not item:
+        raise HTTPException(status_code=404, detail="Moderation item not found")
+    actor_type = item.get("actor_type")
+    actor_id = item.get("actor_id")
+    if actor_type == "user":
+        await db.users.update_one({"id": actor_id}, {"$set": {"is_banned": True, "banned_at": now_iso()}})
+    elif actor_type == "bot":
+        await db.bots.update_one(
+            {"id": actor_id},
+            {"$set": {"is_banned": True, "banned_at": now_iso(), "bot_token_revoked_at": now_epoch()}},
+        )
+        await db.bot_refresh_tokens.delete_many({"bot_id": actor_id})
+    else:
+        raise HTTPException(status_code=400, detail="Unknown actor type")
+    await db.moderation_queue.update_one({"id": item_id}, {"$set": {"status": "resolved", "resolved_by": admin["id"]}})
+    await log_alert_event("actor.banned", {"actor_type": actor_type, "actor_id": actor_id, "item_id": item_id})
+    return {"status": "banned"}
+
+
+@api_router.post("/admin/moderation/{item_id}/shadow-ban")
+async def shadow_ban_actor_from_moderation(item_id: str, admin: Dict[str, Any] = Depends(require_admin)):
+    item = await db.moderation_queue.find_one({"id": item_id})
+    if not item:
+        raise HTTPException(status_code=404, detail="Moderation item not found")
+    actor_type = item.get("actor_type")
+    actor_id = item.get("actor_id")
+    updates = {"is_shadow_banned": True, "shadow_ban_reason": get_shadow_ban_reason(), "shadow_banned_at": now_iso()}
+    if actor_type == "user":
+        await db.users.update_one({"id": actor_id}, {"$set": updates})
+    elif actor_type == "bot":
+        await db.bots.update_one({"id": actor_id}, {"$set": updates})
+    else:
+        raise HTTPException(status_code=400, detail="Unknown actor type")
+    await db.moderation_queue.update_one({"id": item_id}, {"$set": {"status": "resolved", "resolved_by": admin["id"]}})
+    await log_alert_event("actor.shadow_banned", {"actor_type": actor_type, "actor_id": actor_id, "item_id": item_id})
+    return {"status": "shadow_banned"}
+
 @api_router.get("/admin/ops")
 async def ops_checklist(admin: Dict[str, Any] = Depends(require_admin)):
     stripe_configured = bool(STRIPE_SECRET_KEY and STRIPE_PUBLISHABLE_KEY and STRIPE_WEBHOOK_SECRET)
@@ -531,6 +918,94 @@ async def ops_checklist(admin: Dict[str, Any] = Depends(require_admin)):
         "worker_heartbeat": worker_heartbeat,
         "worker_healthy": worker_healthy,
     }
+
+
+@api_router.get("/admin/lookups")
+async def admin_lookups(limit: int = 50, admin: Dict[str, Any] = Depends(require_admin)):
+    try:
+        limit = min(max(1, int(limit)), 200)
+    except Exception:
+        limit = 50
+
+    recent_messages = await db.messages.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    channel_order: List[str] = []
+    channel_last: Dict[str, str] = {}
+    for message in recent_messages:
+        channel_id = message.get("channel_id")
+        if not channel_id:
+            continue
+        if channel_id not in channel_last:
+            channel_last[channel_id] = message.get("created_at")
+            channel_order.append(channel_id)
+
+    channels = []
+    if channel_order:
+        channel_docs = await db.channels.find({"id": {"$in": channel_order}}, {"_id": 0}).to_list(200)
+        channel_map = {c["id"]: c for c in channel_docs}
+        for channel_id in channel_order:
+            channel = channel_map.get(channel_id)
+            if not channel:
+                continue
+            channels.append({
+                **channel,
+                "last_activity_at": channel_last.get(channel_id),
+            })
+
+    room_last: Dict[str, str] = {}
+    for channel in channels:
+        room_id = channel.get("room_id")
+        if not room_id:
+            continue
+        activity = channel.get("last_activity_at")
+        if not activity:
+            continue
+        if room_id not in room_last or room_last[room_id] < activity:
+            room_last[room_id] = activity
+
+    rooms = []
+    if room_last:
+        room_docs = await db.rooms.find({"id": {"$in": list(room_last.keys())}}, {"_id": 0}).to_list(200)
+        room_map = {r["id"]: r for r in room_docs}
+        for room_id, activity in sorted(room_last.items(), key=lambda item: item[1], reverse=True):
+            room = room_map.get(room_id)
+            if not room:
+                continue
+            rooms.append({
+                **room,
+                "last_activity_at": activity,
+            })
+
+    bounties = await db.bounties.find({}, {"_id": 0}).sort("updated_at", -1).to_list(limit)
+
+    return {
+        "rooms_recent": rooms[:limit],
+        "channels_recent": channels[:limit],
+        "bounties_recent": bounties,
+    }
+
+
+@api_router.get("/admin/rate-limits")
+async def admin_rate_limits(admin: Dict[str, Any] = Depends(require_admin)):
+    if not redis_pool:
+        return {"events": [], "available": False}
+    try:
+        raw_events = await redis_pool.lrange("rl:events", 0, 199)
+        events = []
+        for raw in raw_events:
+            try:
+                decoded = raw.decode() if isinstance(raw, bytes) else raw
+                events.append(json.loads(decoded))
+            except Exception:
+                continue
+        return {"events": events, "available": True}
+    except Exception:
+        return {"events": [], "available": False}
+
+
+@api_router.get("/admin/alerts")
+async def admin_alerts(admin: Dict[str, Any] = Depends(require_admin)):
+    items = await db.alert_events.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return {"items": items}
 
 
 @api_router.get("/activity")
@@ -617,6 +1092,14 @@ async def create_checkout_session(
         raise HTTPException(status_code=400, detail="Membership already active")
     if not payload.origin_url:
         raise HTTPException(status_code=400, detail="Origin URL required")
+    allowed_origins = os.environ.get("ALLOWED_ORIGINS", "").split(",")
+    allowed_origins = [origin.strip().rstrip("/") for origin in allowed_origins if origin.strip()]
+    parsed_origin = urlparse(payload.origin_url)
+    if not parsed_origin.scheme or not parsed_origin.netloc:
+        raise HTTPException(status_code=400, detail="Origin URL invalid")
+    origin_root = f"{parsed_origin.scheme}://{parsed_origin.netloc}".rstrip("/")
+    if allowed_origins and origin_root not in allowed_origins:
+        raise HTTPException(status_code=400, detail="Origin URL not allowed")
 
     host_url = str(request.base_url).rstrip("/")
     webhook_url = f"{host_url}/api/webhook/stripe"
@@ -625,8 +1108,8 @@ async def create_checkout_session(
         webhook_secret=STRIPE_WEBHOOK_SECRET,
         webhook_url=webhook_url,
     )
-    success_url = f"{payload.origin_url}/join?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{payload.origin_url}/join?canceled=true"
+    success_url = f"{origin_root}/join?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin_root}/join?canceled=true"
     metadata = {"user_id": user["id"], "email": user["email"], "purpose": "join_fee"}
 
     checkout_request = CheckoutSessionRequest(
@@ -967,6 +1450,39 @@ async def post_message(
     payload: MessageCreate,
     user: Dict[str, Any] = Depends(require_active_member),
 ):
+    allowed = await rate_limit(
+        f"rl:msg:user:{user['id']}",
+        get_rate_limit("RATE_LIMIT_MESSAGES_PER_MIN", 30),
+        60,
+    )
+    if not allowed:
+        await log_rate_limit_event("user", user["id"], "/channels/{channel_id}/messages", "rate limit exceeded")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    if await detect_duplicate_content("user", user["id"], payload.content):
+        await log_moderation_event(
+            "user",
+            user["id"],
+            "message",
+            payload.content,
+            "duplicate content spam",
+            metadata={"channel_id": channel_id},
+        )
+        if await should_alert_on_moderation("user", user["id"]):
+            await log_alert_event("moderation.spike", {"actor_type": "user", "actor_id": user["id"]})
+        raise HTTPException(status_code=429, detail="Duplicate content detected")
+    moderation_error = moderate_text(payload.content)
+    if moderation_error:
+        await log_moderation_event(
+            "user",
+            user["id"],
+            "message",
+            payload.content,
+            moderation_error,
+            metadata={"channel_id": channel_id},
+        )
+        if await should_alert_on_moderation("user", user["id"]):
+            await log_alert_event("moderation.spike", {"actor_type": "user", "actor_id": user["id"]})
+        raise HTTPException(status_code=400, detail=moderation_error)
     channel = await db.channels.find_one({"id": channel_id})
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
@@ -976,6 +1492,8 @@ async def post_message(
     )
     if not membership:
         raise HTTPException(status_code=403, detail="Join the room first")
+    if user.get("is_shadow_banned"):
+        return {"message": {"id": new_id(), "channel_id": channel_id, "sender_type": "user", "sender_id": user["id"], "sender_handle": user.get("handle"), "content": payload.content, "metadata": {"shadow_banned": True}, "created_at": now_iso()}}
     message_doc = {
         "id": new_id(),
         "channel_id": channel_id,
@@ -996,6 +1514,39 @@ async def post_message(
 
 @api_router.post("/bot/messages")
 async def post_bot_message(payload: BotMessageCreate, bot: Dict[str, Any] = Depends(get_current_bot)):
+    allowed = await rate_limit(
+        f"rl:msg:bot:{bot['id']}",
+        get_rate_limit("RATE_LIMIT_BOT_MESSAGES_PER_MIN", 60),
+        60,
+    )
+    if not allowed:
+        await log_rate_limit_event("bot", bot["id"], "/bot/messages", "rate limit exceeded")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    if await detect_duplicate_content("bot", bot["id"], payload.content):
+        await log_moderation_event(
+            "bot",
+            bot["id"],
+            "message",
+            payload.content,
+            "duplicate content spam",
+            metadata={"channel_id": payload.channel_id},
+        )
+        if await should_alert_on_moderation("bot", bot["id"]):
+            await log_alert_event("moderation.spike", {"actor_type": "bot", "actor_id": bot["id"]})
+        raise HTTPException(status_code=429, detail="Duplicate content detected")
+    moderation_error = moderate_text(payload.content)
+    if moderation_error:
+        await log_moderation_event(
+            "bot",
+            bot["id"],
+            "message",
+            payload.content,
+            moderation_error,
+            metadata={"channel_id": payload.channel_id},
+        )
+        if await should_alert_on_moderation("bot", bot["id"]):
+            await log_alert_event("moderation.spike", {"actor_type": "bot", "actor_id": bot["id"]})
+        raise HTTPException(status_code=400, detail=moderation_error)
     channel = await db.channels.find_one({"id": payload.channel_id})
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
@@ -1013,6 +1564,8 @@ async def post_bot_message(payload: BotMessageCreate, bot: Dict[str, Any] = Depe
     )
     if not membership:
         raise HTTPException(status_code=403, detail="Bot not in room")
+    if bot.get("is_shadow_banned"):
+        return {"message": {"id": new_id(), "channel_id": payload.channel_id, "sender_type": "bot", "sender_id": bot["id"], "sender_handle": bot.get("handle"), "content": payload.content, "metadata": {"bot": True, "shadow_banned": True}, "created_at": now_iso()}}
 
     message_doc = {
         "id": new_id(),
@@ -1050,11 +1603,14 @@ async def create_bot(payload: BotCreate, user: Dict[str, Any] = Depends(require_
         "connect_url": payload.connect_url or "",
         "status": payload.status or "offline",
         "capabilities": {},
+        "allowed_room_ids": [],
+        "allowed_channel_ids": [],
         "bot_secret_encrypted": encrypt_secret(raw_secret),
         "bot_secret_last_rotated_at": now,
         "handshake_challenge": None,
         "handshake_expires_at": None,
         "handshake_verified_at": None,
+        "bot_token_revoked_at": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -1103,6 +1659,14 @@ async def create_bot_handshake_challenge(
 
 @api_router.post("/bots/{bot_id}/handshake/verify")
 async def verify_bot_handshake(bot_id: str, payload: BotHandshakeVerify):
+    allowed = await rate_limit(
+        f"rl:handshake:bot:{bot_id}",
+        get_rate_limit("RATE_LIMIT_HANDSHAKE_PER_MIN", 10),
+        60,
+    )
+    if not allowed:
+        await log_rate_limit_event("bot", bot_id, "/bots/{bot_id}/handshake/verify", "rate limit exceeded")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     bot = await db.bots.find_one({"id": bot_id})
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
@@ -1123,6 +1687,8 @@ async def verify_bot_handshake(bot_id: str, payload: BotHandshakeVerify):
     updates = {
         "capabilities": capabilities,
         "skills": capabilities.get("skills", bot.get("skills", [])),
+        "allowed_room_ids": payload.allowed_room_ids,
+        "allowed_channel_ids": payload.allowed_channel_ids,
         "handshake_verified_at": now_iso(),
         "handshake_challenge": None,
         "handshake_expires_at": None,
@@ -1131,8 +1697,44 @@ async def verify_bot_handshake(bot_id: str, payload: BotHandshakeVerify):
     }
     await db.bots.update_one({"id": bot_id}, {"$set": updates})
     scopes = {"rooms": payload.allowed_room_ids, "channels": payload.allowed_channel_ids}
-    bot_token = create_bot_token(bot_id, scopes)
-    return {"bot_token": bot_token, "scopes": scopes, "expires_in_days": BOT_TOKEN_EXPIRE_DAYS}
+    tokens = await issue_bot_tokens(bot_id, scopes)
+    return {"bot_token": tokens["bot_token"], "refresh_token": tokens["refresh_token"], "scopes": scopes, "expires_in_days": tokens["expires_in_days"]}
+
+
+@api_router.post("/bots/{bot_id}/token/refresh")
+async def refresh_bot_token(bot_id: str, payload: BotTokenRefresh):
+    allowed = await rate_limit(
+        f"rl:refresh:bot:{bot_id}",
+        get_rate_limit("RATE_LIMIT_REFRESH_PER_MIN", 5),
+        60,
+    )
+    if not allowed:
+        await log_rate_limit_event("bot", bot_id, "/bots/{bot_id}/token/refresh", "rate limit exceeded")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    token_hash = hash_refresh_token(payload.refresh_token)
+    token_doc = await db.bot_refresh_tokens.find_one({"bot_id": bot_id, "token_hash": token_hash})
+    if not token_doc:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    if token_doc.get("expires_at") and int(token_doc["expires_at"]) < now_epoch():
+        await db.bot_refresh_tokens.delete_one({"id": token_doc.get("id")})
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+    bot = await db.bots.find_one({"id": bot_id})
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    scopes = {"rooms": bot.get("allowed_room_ids", []), "channels": bot.get("allowed_channel_ids", [])}
+    await db.bot_refresh_tokens.delete_one({"id": token_doc.get("id")})
+    tokens = await issue_bot_tokens(bot_id, scopes)
+    return {"bot_token": tokens["bot_token"], "refresh_token": tokens["refresh_token"], "expires_in_days": tokens["expires_in_days"]}
+
+
+@api_router.post("/bots/{bot_id}/tokens/revoke")
+async def revoke_bot_tokens(bot_id: str, user: Dict[str, Any] = Depends(require_active_member)):
+    bot = await db.bots.find_one({"id": bot_id, "owner_user_id": user["id"]})
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    await db.bots.update_one({"id": bot_id}, {"$set": {"bot_token_revoked_at": now_epoch(), "updated_at": now_iso()}})
+    await db.bot_refresh_tokens.delete_many({"bot_id": bot_id})
+    return {"status": "revoked"}
 
 
 @api_router.get("/me/bots")
@@ -1143,6 +1745,19 @@ async def list_my_bots(user: Dict[str, Any] = Depends(require_active_member)):
 
 @api_router.post("/bounties")
 async def create_bounty(payload: BountyCreate, user: Dict[str, Any] = Depends(require_active_member)):
+    moderation_error = moderate_text(payload.title) or moderate_text(payload.description)
+    if moderation_error:
+        await log_moderation_event(
+            "user",
+            user["id"],
+            "bounty",
+            f"{payload.title}\n\n{payload.description}",
+            moderation_error,
+            metadata={"room_id": payload.room_id},
+        )
+        if await should_alert_on_moderation("user", user["id"]):
+            await log_alert_event("moderation.spike", {"actor_type": "user", "actor_id": user["id"]})
+        raise HTTPException(status_code=400, detail=moderation_error)
     if payload.room_id:
         membership = await db.room_memberships.find_one(
             {"room_id": payload.room_id, "member_type": "user", "member_id": user["id"]}
@@ -1177,6 +1792,7 @@ async def list_bounties(
     status_filter: Optional[str] = Query(None, alias="status"),
     tag: Optional[str] = None,
     sort: Optional[str] = None,
+    limit: Optional[int] = None,
     user: Dict[str, Any] = Depends(require_active_member),
 ):
     query: Dict[str, Any] = {}
@@ -1189,7 +1805,14 @@ async def list_bounties(
     if sort == "reward":
         sort_field = "reward_amount"
         sort_direction = -1
-    bounties = await db.bounties.find(query, {"_id": 0}).sort(sort_field, sort_direction).to_list(500)
+    max_limit = 500
+    if limit is None:
+        limit = max_limit
+    try:
+        limit = min(max(1, int(limit)), max_limit)
+    except Exception:
+        limit = max_limit
+    bounties = await db.bounties.find(query, {"_id": 0}).sort(sort_field, sort_direction).to_list(limit)
     return {"items": bounties}
 
 
@@ -1231,6 +1854,19 @@ async def claim_bounty(bounty_id: str, user: Dict[str, Any] = Depends(require_ac
 async def create_bounty_update(
     bounty_id: str, payload: BountyUpdateCreate, user: Dict[str, Any] = Depends(require_active_member)
 ):
+    moderation_error = moderate_text(payload.content)
+    if moderation_error:
+        await log_moderation_event(
+            "user",
+            user["id"],
+            "bounty_update",
+            payload.content,
+            moderation_error,
+            metadata={"bounty_id": bounty_id},
+        )
+        if await should_alert_on_moderation("user", user["id"]):
+            await log_alert_event("moderation.spike", {"actor_type": "user", "actor_id": user["id"]})
+        raise HTTPException(status_code=400, detail=moderation_error)
     bounty = await db.bounties.find_one({"id": bounty_id})
     if not bounty:
         raise HTTPException(status_code=404, detail="Bounty not found")
@@ -1285,13 +1921,38 @@ async def update_bounty_status(
 
 
 @app.websocket("/api/ws")
-async def websocket_endpoint(websocket: WebSocket, channelId: str):
+async def websocket_endpoint(websocket: WebSocket, channelId: str, token: Optional[str] = None):
+    token = token or websocket.cookies.get("spark_token")
+    if not token:
+        await websocket.close(code=4401)
+        return
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") == "bot":
+            await websocket.close(code=4401)
+            return
+        user_id = payload.get("sub")
+    except JWTError:
+        await websocket.close(code=4401)
+        return
+
+    channel = await db.channels.find_one({"id": channelId})
+    if not channel:
+        await websocket.close(code=4404)
+        return
+    membership = await db.room_memberships.find_one(
+        {"room_id": channel["room_id"], "member_type": "user", "member_id": user_id}
+    )
+    if not membership:
+        await websocket.close(code=4403)
+        return
+
     await manager.connect(channelId, websocket)
     try:
         while True:
             data = await websocket.receive_json()
             if data.get("type") == "typing":
-                await manager.broadcast(channelId, {"type": "typing", "user": data.get("user")})
+                await manager.broadcast(channelId, {"type": "typing", "user": {"id": user_id}})
     except WebSocketDisconnect:
         manager.disconnect(channelId, websocket)
 
@@ -1301,7 +1962,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=[origin.strip() for origin in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1327,8 +1988,18 @@ async def shutdown_db_client():
 # ============================================
 
 @api_router.post("/bots/{bot_id}/heartbeat")
-async def bot_heartbeat(bot_id: str, payload: dict = None):
+async def bot_heartbeat(bot_id: str, payload: dict = None, bot: Dict[str, Any] = Depends(get_current_bot)):
     """Update bot presence - called periodically by connected bots"""
+    if bot.get("id") != bot_id:
+        raise HTTPException(status_code=403, detail="Bot not authorized")
+    allowed = await rate_limit(
+        f"rl:heartbeat:bot:{bot_id}",
+        get_rate_limit("RATE_LIMIT_HEARTBEAT_PER_MIN", 60),
+        60,
+    )
+    if not allowed:
+        await log_rate_limit_event("bot", bot_id, "/bots/{bot_id}/heartbeat", "rate limit exceeded")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     now = now_iso()
     await db.bots.update_one(
         {"id": bot_id},
@@ -1389,6 +2060,13 @@ async def get_bot_reputation(bot_id: str):
             "messages_sent": messages_sent
         }
     }
+
+
+@api_router.get("/bots/{bot_id}/trust")
+async def get_bot_trust(bot_id: str, user: Dict[str, Any] = Depends(require_active_member)):
+    trust = await compute_bot_trust(bot_id)
+    return trust
+
 
 
 @api_router.get("/bots/{bot_id}/presence")
@@ -1452,3 +2130,77 @@ async def list_bots(
         })
     
     return {"items": enriched_bots}
+def get_cookie_settings() -> Dict[str, Any]:
+    secure = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
+    domain = os.environ.get("COOKIE_DOMAIN") or None
+    samesite = os.environ.get("COOKIE_SAMESITE", "lax").lower()
+    if samesite not in {"lax", "strict", "none"}:
+        samesite = "lax"
+    return {
+        "httponly": True,
+        "secure": secure,
+        "samesite": samesite,
+        "path": "/",
+        "domain": domain,
+    }
+
+
+def set_auth_cookies(response: Response, token: str, csrf_token: str):
+    cookie_settings = get_cookie_settings()
+    response.set_cookie("spark_token", token, **cookie_settings)
+    # CSRF token must be readable by JS for double-submit.
+    csrf_settings = {**cookie_settings, "httponly": False}
+    response.set_cookie("spark_csrf", csrf_token, **csrf_settings)
+
+
+def clear_auth_cookies(response: Response):
+    cookie_settings = get_cookie_settings()
+    response.delete_cookie("spark_token", **cookie_settings)
+    response.delete_cookie("spark_csrf", **{**cookie_settings, "httponly": False})
+
+
+def get_csrf_token_value() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def extract_bearer_token(credentials: Optional[HTTPAuthorizationCredentials]) -> Optional[str]:
+    if not credentials:
+        return None
+    return credentials.credentials
+
+
+def extract_cookie_token(request: Request) -> Optional[str]:
+    return request.cookies.get("spark_token")
+
+
+def extract_csrf_cookie(request: Request) -> Optional[str]:
+    return request.cookies.get("spark_csrf")
+
+
+def extract_csrf_header(request: Request) -> Optional[str]:
+    return request.headers.get("X-CSRF-Token")
+
+
+def is_unsafe_method(request: Request) -> bool:
+    return request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def is_csrf_exempt(path: str) -> bool:
+    if path in {"/api/webhook/stripe", "/api/auth/csrf"}:
+        return True
+    if path.endswith("/token/refresh"):
+        return True
+    return False
+
+
+@app.middleware("http")
+async def csrf_protect(request: Request, call_next):
+    if request.url.path.startswith("/api") and is_unsafe_method(request) and not is_csrf_exempt(request.url.path):
+        # Skip CSRF for bearer-token requests (non-browser clients/bots).
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            csrf_cookie = extract_csrf_cookie(request)
+            csrf_header = extract_csrf_header(request)
+            if not csrf_cookie or not csrf_header or not hmac.compare_digest(csrf_cookie, csrf_header):
+                return JSONResponse(status_code=403, content={"detail": "CSRF token invalid"})
+    return await call_next(request)
