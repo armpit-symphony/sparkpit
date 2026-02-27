@@ -48,6 +48,12 @@ const webpackConfig = {
     },
     configure: (webpackConfig) => {
 
+      // Disable ForkTsCheckerWebpackPlugin to avoid AJV keyword conflicts during build
+      webpackConfig.plugins = (webpackConfig.plugins || []).filter(
+        (p) => !(p && p.constructor && p.constructor.name === "ForkTsCheckerWebpackPlugin")
+      );
+
+
       // Add ignored patterns to reduce watched directories
         webpackConfig.watchOptions = {
           ...webpackConfig.watchOptions,

@@ -14,8 +14,8 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 
 import redis.asyncio as redis
-from arq.connections import RedisPool
-from arq.constants import JobResult
+from arq.connections import RedisSettings
+from arq.connections import RedisSettings
 from pydantic import BaseModel, Field
 
 # Setup logging
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Environment
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 
 
 # Data Models
@@ -50,8 +50,9 @@ class ActivityFeedItem(BaseModel):
 
 
 class WorkerSettings:
+    functions = ["backend.worker.process_audit_event", "backend.worker.index_activity_feed", "backend.worker.cleanup_old_data", "backend.worker.handle_background_job"]
     """ARQ worker settings."""
-    redis_settings = None  # Will be set during initialization
+    redis_settings = RedisSettings.from_dsn(REDIS_URL)
     max_jobs = 100
     keep_results = 3600  # Keep results for 1 hour
     job_timeout = 300  # 5 minute timeout
@@ -140,64 +141,59 @@ async def process_audit_event(ctx, event_data: Dict[str, Any]) -> Dict[str, Any]
 async def index_activity_feed(ctx, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Index activity feed for a user or globally.
-    
-    Args:
-        ctx: ARQ context
-        user_id: Optional user ID to filter by
-    
-    Returns:
-        Indexing result with activity count
     """
     redis_conn = ctx["redis"]
-    
+
     try:
         if user_id:
-            # Get activities for specific user
             activity_key = f"tsp:activity:{user_id}"
             activities = await redis_conn.lrange(activity_key, 0, 99)
-            
-            # Rebuild activity index
+
             index_key = f"tsp:activity_index:{user_id}"
             await redis_conn.delete(index_key)
-            
-            for i, activity_json in enumerate(activities):
+
+            for activity_json in activities:
                 activity = json.loads(activity_json)
                 await redis_conn.zadd(
                     index_key,
                     {activity["id"]: activity["created_at"].timestamp()}
                 )
-            
+
             count = len(activities)
             logger.info(f"Indexed {count} activities for user {user_id}")
-            
-        else:
-            # Rebuild global activity index
-            global_activity_key = "tsp:activity:global"
-            activities = await redis_conn.zrange(
-                global_activity_key, 0, 999, withscores=True
-            )
-            
-            index_key = "tsp:activity_index:global"
-            await redis_conn.delete(index_key)
-            
-            for activity_id, score in activities:
-                await redis_conn.zadd(index_key, {activity_id: score})
-            
-            count = len(activities)
-            logger.info(f"Indexed {count} global return {
+
+            return {
+                "success": True,
+                "scope": "user",
+                "user_id": user_id,
+                "indexed_count": count,
+                "indexed_at": datetime.utcnow().isoformat()
+            }
+
+        global_activity_key = "tsp:activity:global"
+        activities = await redis_conn.zrange(
+            global_activity_key, 0, 999, withscores=True
+        )
+
+        index_key = "tsp:activity_index:global"
+        await redis_conn.delete(index_key)
+
+        for activity_id, score in activities:
+            await redis_conn.zadd(index_key, {activity_id: score})
+
+        count = len(activities)
+        logger.info(f"Indexed {count} activities for global feed")
+
+        return {
             "success": True,
- activities")
-        
-                   "user_id": user_id,
+            "scope": "global",
             "indexed_count": count,
             "indexed_at": datetime.utcnow().isoformat()
         }
-        
+
     except Exception as e:
         logger.error(f"Failed to index activity feed: {e}")
         return {"success": False, "error": str(e)}
-
-
 async def cleanup_old_data(ctx, retention_days: int = 30) -> Dict[str, Any]:
     """
     Clean up old audit logs and activity data.
@@ -322,7 +318,7 @@ class ARQWorker:
     """ARQ Worker manager for The-Spark-Pit."""
     
     def __init__(self):
-        self.redis_pool: Optional[RedisPool] = None
+        self.redis_pool = None
         self.redis_conn: Optional[redis.Redis] = None
         
     async def startup(self):
