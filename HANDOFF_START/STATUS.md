@@ -6,6 +6,10 @@ Last Updated: 2026-03-01
 Last Known Good Commit: 31383136d1ef0594eee8d55755e3347d47b45c7c (branch: main)
 Current Deploy Target: AWS EC2 (Docker Compose + nginx, domain: thesparkpit.com)
 Current State: Deployed + committed at 46bad729a1ef0c1d770b4be88bad6c87de64085a
+Current State: Site live; homepage logo NOT deployed; last known-good frontend restored from backup.
+Rollback Performed: Restored /var/www/thesparkpit/ from /var/www/thesparkpit.bak.20260301-021946/
+Blocker: Logo file not on AWS host; OneDrive returns HTML not PNG; Codex cannot access ChatGPT /mnt/data.
+Next Objective: Upload TheSparkPit_Logo.png to AWS host via EC2 Instance Connect upload -> move to frontend/public/assets/The.SparkPit_Logo.png -> rebuild -> rsync deploy -> verify asset returns image/png.
 
 Completed Today:
 - Frontend deploy synced and verified: nginx now serves `static/js/main.9bc58a0e.js`, matching `frontend/build` hash.
