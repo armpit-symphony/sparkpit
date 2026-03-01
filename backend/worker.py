@@ -1,3 +1,4 @@
+import time
 """
 ARQ Worker for The-Spark-Pit
 
@@ -6,16 +7,55 @@ and handles background jobs using ARQ (Async Redis Queue).
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from pathlib import Path
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# ---- Worker heartbeat (Redis) ----
+HEARTBEAT_KEY = "sparkpit:worker:heartbeat"
+
+async def _heartbeat_loop(redis):
+    """Write a simple unix-epoch heartbeat every 10s."""
+    while True:
+        try:
+            ts = str(int(time.time()))
+            # set with TTL so stale workers expire automatically
+            await redis.set(HEARTBEAT_KEY, ts, ex=120)
+        except Exception as e:
+            # do not crash worker; log once per loop
+            print("HEARTBEAT_WRITE_FAIL:", repr(e))
+        await asyncio.sleep(10)
+
+
+async def arq_on_startup(ctx):
+    """ARQ startup hook for `arq backend.worker.WorkerSettings`."""
+    redis_conn = ctx["redis"]
+    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    ctx["mongo_client"] = mongo_client
+    ctx["db"] = mongo_client[DB_NAME]
+    ctx["heartbeat_task"] = asyncio.create_task(_heartbeat_loop(redis_conn))
+    print("HEARTBEAT_LOOP_STARTED")
+
+
+async def arq_on_shutdown(ctx):
+    """Cancel the heartbeat task on worker shutdown."""
+    task = ctx.get("heartbeat_task")
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    mongo_client = ctx.get("mongo_client")
+    if mongo_client is not None:
+        mongo_client.close()
 
 import redis.asyncio as redis
 from arq.connections import RedisSettings
-from arq.connections import RedisSettings
+from arq.worker import Retry
 from pydantic import BaseModel, Field
 
 # Setup logging
@@ -24,6 +64,8 @@ logger = logging.getLogger(__name__)
 
 # Environment
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+MONGO_URL = os.environ.get("MONGO_URL", "mongodb://mongodb:27017")
+DB_NAME = os.environ.get("DB_NAME", "thesparkpit")
 
 
 # Data Models
@@ -32,7 +74,9 @@ class AuditEvent(BaseModel):
     id: str = Field(default_factory=lambda: f"audit_{datetime.utcnow().isoformat()}")
     event_type: str
     user_id: Optional[str] = None
-    action: str
+    actor_type: Optional[str] = None
+    actor_id: Optional[str] = None
+    action: Optional[str] = None
     resource: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
@@ -50,9 +94,21 @@ class ActivityFeedItem(BaseModel):
 
 
 class WorkerSettings:
-    functions = ["backend.worker.process_audit_event", "backend.worker.index_activity_feed", "backend.worker.cleanup_old_data", "backend.worker.handle_background_job"]
+    functions = [
+        "backend.worker.process_audit_event",
+        "backend.worker.index_message",
+        "backend.worker.retry_probe",
+        "backend.jobs.bot_reply.generate_bot_reply",
+        "backend.jobs.room_summary.summarize_room",
+        "backend.worker.process_bounty_status",
+        "backend.worker.index_activity_feed",
+        "backend.worker.cleanup_old_data",
+        "backend.worker.handle_background_job",
+    ]
     """ARQ worker settings."""
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
+    on_startup = arq_on_startup
+    on_shutdown = arq_on_shutdown
     max_jobs = 100
     keep_results = 3600  # Keep results for 1 hour
     job_timeout = 300  # 5 minute timeout
@@ -76,6 +132,8 @@ async def process_audit_event(ctx, event_data: Dict[str, Any]) -> Dict[str, Any]
     try:
         # Validate and parse audit event
         audit_event = AuditEvent(**event_data)
+        if not audit_event.action:
+            audit_event.action = audit_event.event_type
         
         logger.info(f"Processing audit event: {audit_event.event_type} - {audit_event.action}")
         
@@ -136,6 +194,90 @@ async def process_audit_event(ctx, event_data: Dict[str, Any]) -> Dict[str, Any]
             "error": str(e),
             "event_id": event_data.get("id", "unknown")
         }
+
+
+async def index_message(ctx, message_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Index a posted message into Redis for lightweight lookup/feed views."""
+    redis_conn = ctx["redis"]
+    try:
+        message_id = message_data.get("id")
+        channel_id = message_data.get("channel_id")
+        if not message_id or not channel_id:
+            return {"success": False, "error": "missing message id or channel_id"}
+
+        created_at = message_data.get("created_at")
+        score = time.time()
+        if isinstance(created_at, str):
+            try:
+                score = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+
+        await redis_conn.set(
+            f"tsp:message:{message_id}",
+            json.dumps(message_data),
+            ex=86400 * 7,
+        )
+        channel_index_key = f"tsp:channel:{channel_id}:messages"
+        await redis_conn.zadd(channel_index_key, {message_id: score})
+        await redis_conn.zremrangebyrank(channel_index_key, 0, -2001)
+
+        return {
+            "success": True,
+            "message_id": message_id,
+            "channel_id": channel_id,
+            "indexed_at": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Failed to index message: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def process_bounty_status(ctx, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Track bounty status changes in Redis for fast ops visibility."""
+    redis_conn = ctx["redis"]
+    try:
+        bounty_id = payload.get("bounty_id")
+        status = payload.get("status")
+        if not bounty_id or not status:
+            return {"success": False, "error": "missing bounty_id or status"}
+
+        now = datetime.utcnow().isoformat()
+        history_key = f"tsp:bounty:{bounty_id}:status_history"
+        await redis_conn.lpush(history_key, json.dumps({"status": status, "updated_at": now}))
+        await redis_conn.ltrim(history_key, 0, 99)
+        await redis_conn.set(f"tsp:bounty:{bounty_id}:status", status, ex=86400 * 30)
+
+        return {"success": True, "bounty_id": bounty_id, "status": status, "updated_at": now}
+    except Exception as e:
+        logger.error(f"Failed to process bounty status: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def retry_probe(ctx, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Probe job for runbook retry/backoff verification.
+    Fails for initial attempts, then succeeds once threshold is reached.
+    """
+    redis_conn = ctx["redis"]
+    probe_id = payload.get("probe_id")
+    if not probe_id:
+        raise ValueError("probe_id is required")
+    succeed_on = int(payload.get("succeed_on", 2))
+    defer_seconds = int(payload.get("defer_seconds", 2))
+    key = f"tsp:retry_probe:{probe_id}:attempts"
+    attempt = await redis_conn.incr(key)
+    await redis_conn.expire(key, 3600)
+    if attempt < succeed_on:
+        # Explicit retry with delay makes backoff visible in logs/timestamps.
+        raise Retry(defer=defer_seconds)
+    return {
+        "success": True,
+        "probe_id": probe_id,
+        "attempt": int(attempt),
+        "succeed_on": succeed_on,
+        "completed_at": datetime.utcnow().isoformat(),
+    }
 
 
 async def index_activity_feed(ctx, user_id: Optional[str] = None) -> Dict[str, Any]:

@@ -357,8 +357,16 @@ def sanitize_bot(bot: Dict[str, Any]) -> Dict[str, Any]:
 async def enqueue_job(job_name: str, payload: Dict[str, Any]):
     if not redis_pool:
         return
+    job_name_map = {
+        "process_audit_event": "backend.worker.process_audit_event",
+        "index_message": "backend.worker.index_message",
+        "generate_bot_reply": "backend.jobs.bot_reply.generate_bot_reply",
+        "process_bounty_status": "backend.worker.process_bounty_status",
+        "summarize_room": "backend.jobs.room_summary.summarize_room",
+    }
+    resolved_job_name = job_name_map.get(job_name, job_name)
     try:
-        await redis_pool.enqueue_job(job_name, payload)
+        await redis_pool.enqueue_job(resolved_job_name, payload)
     except Exception as error:
         logger.warning("Queue enqueue failed: %s", error)
 
@@ -402,6 +410,80 @@ async def log_audit(
     }
     await db.audit_events.insert_one(audit_doc)
     await enqueue_job("process_audit_event", audit_doc)
+
+
+def get_request_ip(request: Request) -> Optional[str]:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
+def get_request_meta(request: Request) -> Dict[str, Any]:
+    return {
+        "ip": get_request_ip(request),
+        "user_agent": request.headers.get("user-agent"),
+        "ts": now_iso(),
+    }
+
+
+async def can_access_room(user: Dict[str, Any], room_id: str) -> bool:
+    if user.get("role") == "admin":
+        return True
+    membership = await db.room_memberships.find_one(
+        {"room_id": room_id, "member_type": "user", "member_id": user["id"]}
+    )
+    return membership is not None
+
+
+async def can_manage_room(user: Dict[str, Any], room_id: str) -> bool:
+    if user.get("role") == "admin":
+        return True
+    membership = await db.room_memberships.find_one(
+        {"room_id": room_id, "member_type": "user", "member_id": user["id"]}
+    )
+    membership = sanitize_doc(membership) if membership else None
+    return bool(membership and membership.get("role") in ["owner", "moderator"])
+
+
+async def log_task_event(
+    task_id: str,
+    room_id: str,
+    event_type: str,
+    actor_user_id: str,
+    payload: Optional[Dict[str, Any]] = None,
+):
+    event_doc = {
+        "id": new_id(),
+        "task_id": task_id,
+        "room_id": room_id,
+        "event_type": event_type,
+        "actor_user_id": actor_user_id,
+        "payload": payload or {},
+        "created_at": now_iso(),
+    }
+    await db.task_events.insert_one(event_doc)
+    return sanitize_doc(event_doc)
+
+
+async def log_room_event(
+    room_id: str,
+    event_type: str,
+    actor_user_id: str,
+    payload: Optional[Dict[str, Any]] = None,
+):
+    event_doc = {
+        "id": new_id(),
+        "room_id": room_id,
+        "event_type": event_type,
+        "actor_user_id": actor_user_id,
+        "payload": payload or {},
+        "created_at": now_iso(),
+    }
+    await db.room_events.insert_one(event_doc)
+    return sanitize_doc(event_doc)
 
 
 async def update_reputation(user_id: str, field: str):
@@ -516,6 +598,53 @@ class BountyUpdateCreate(BaseModel):
 
 class BountyStatusUpdate(BaseModel):
     status: str
+
+
+class TaskCreate(BaseModel):
+    room_id: str
+    title: str
+    description: Optional[str] = ""
+    priority: str = "normal"
+    tags: List[str] = []
+
+
+class TaskAssign(BaseModel):
+    assignee_user_id: str
+
+
+class TaskStateUpdate(BaseModel):
+    state: str
+    note: Optional[str] = None
+
+
+class TaskArtifactCreate(BaseModel):
+    kind: str = "note"
+    title: str
+    url: Optional[str] = None
+    body: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+
+class ProposalResource(BaseModel):
+    title: str
+    url: str
+
+
+class TaskProposalCreate(BaseModel):
+    title: str
+    summary: str
+    steps: List[str] = []
+    risks: List[str] = []
+    resources: List[ProposalResource] = []
+
+
+class TaskVoteCreate(BaseModel):
+    proposal_id: str
+    vote: str
+
+
+class RoomMemorySummarizeRequest(BaseModel):
+    note: Optional[str] = None
 
 
 class CheckoutSessionCreate(BaseModel):
@@ -705,24 +834,81 @@ async def register(user: UserCreate, request: Request, response: Response):
     user_doc.pop("password_hash", None)
     csrf_token = get_csrf_token_value()
     set_auth_cookies(response, token, csrf_token)
+    await log_audit(
+        "auth.register",
+        "user",
+        user_doc["id"],
+        payload={
+            **get_request_meta(request),
+            "success": True,
+            "email": user_doc.get("email"),
+            "membership_status": user_doc.get("membership_status"),
+        },
+    )
     return {"token": None, "user": user_doc}
 
 
 @api_router.post("/auth/login", response_model=AuthResponse)
-async def login(user: UserLogin, response: Response):
+async def login(user: UserLogin, request: Request, response: Response):
     existing = await db.users.find_one({"email": user.email})
     if not existing or not verify_password(user.password, existing.get("password_hash", "")):
+        await log_audit(
+            "auth.login.failure",
+            "anonymous",
+            existing.get("id") if existing else "unknown",
+            payload={
+                **get_request_meta(request),
+                "success": False,
+                "reason": "invalid_credentials",
+                "email": user.email,
+            },
+        )
         raise HTTPException(status_code=400, detail="Invalid credentials")
     existing = sanitize_doc(existing)
     token = create_token(existing)
     existing.pop("password_hash", None)
     csrf_token = get_csrf_token_value()
     set_auth_cookies(response, token, csrf_token)
+    await log_audit(
+        "auth.login.success",
+        "user",
+        existing["id"],
+        payload={
+            **get_request_meta(request),
+            "success": True,
+            "email": existing.get("email"),
+        },
+    )
     return {"token": None, "user": existing}
 
 
 @api_router.post("/auth/logout")
-async def logout(response: Response):
+async def logout(request: Request, response: Response):
+    token = extract_cookie_token(request)
+    auth_header = request.headers.get("Authorization", "")
+    if not token and auth_header.startswith("Bearer "):
+        token = auth_header.removeprefix("Bearer ").strip()
+    actor_type = "anonymous"
+    actor_id = "unknown"
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            if payload.get("type") != "bot":
+                actor_type = "user"
+                actor_id = payload.get("sub") or "unknown"
+        except JWTError:
+            actor_type = "anonymous"
+            actor_id = "unknown"
+    await log_audit(
+        "auth.logout",
+        actor_type,
+        actor_id,
+        payload={
+            **get_request_meta(request),
+            "success": True,
+            "token_present": bool(token),
+        },
+    )
     clear_auth_cookies(response)
     return {"status": "ok"}
 
@@ -775,7 +961,7 @@ async def update_me(payload: UserUpdate, user: Dict[str, Any] = Depends(get_curr
 
 
 @api_router.post("/admin/invite-codes")
-async def create_invite_code(payload: InviteCodeCreate, admin: Dict[str, Any] = Depends(require_admin)):
+async def create_invite_code(payload: InviteCodeCreate, request: Request, admin: Dict[str, Any] = Depends(require_admin)):
     code_value = payload.code or f"SPARK-{uuid.uuid4().hex[:8].upper()}"
     now = now_iso()
     code_doc = {
@@ -790,6 +976,21 @@ async def create_invite_code(payload: InviteCodeCreate, admin: Dict[str, Any] = 
     await db.invite_codes.insert_one(code_doc)
     code_doc = sanitize_doc(code_doc)
     await log_audit("invite.created", "user", admin["id"], payload={"code": code_value})
+    await log_audit(
+        "admin.invite_code.create",
+        "user",
+        admin["id"],
+        payload={
+            **get_request_meta(request),
+            "admin_user_id": admin["id"],
+            "action": "invite_code.create",
+            "code": code_value,
+            "max_uses": payload.max_uses,
+            "expires_at": payload.expires_at,
+            "before": None,
+            "after": {"uses": 0, "max_uses": payload.max_uses},
+        },
+    )
     return {"invite_code": code_doc}
 
 
@@ -836,8 +1037,14 @@ async def list_moderation_queue(
 async def resolve_moderation_item(
     item_id: str,
     payload: ModerationResolve,
+    request: Request,
     admin: Dict[str, Any] = Depends(require_admin),
 ):
+    item = await db.moderation_queue.find_one({"id": item_id})
+    if not item:
+        raise HTTPException(status_code=404, detail="Moderation item not found")
+    item = sanitize_doc(item)
+    before_status = item.get("status")
     updates = {
         "status": payload.status,
         "updated_at": now_iso(),
@@ -846,16 +1053,41 @@ async def resolve_moderation_item(
     if payload.notes:
         updates["notes"] = payload.notes
     await db.moderation_queue.update_one({"id": item_id}, {"$set": updates})
+    await log_audit(
+        "admin.moderation.resolve",
+        "user",
+        admin["id"],
+        payload={
+            **get_request_meta(request),
+            "admin_user_id": admin["id"],
+            "target_user_id": item.get("actor_id") if item.get("actor_type") == "user" else None,
+            "target_actor_type": item.get("actor_type"),
+            "target_actor_id": item.get("actor_id"),
+            "action": "moderation.resolve",
+            "item_id": item_id,
+            "before": {"status": before_status},
+            "after": {"status": payload.status},
+            "note_present": bool(payload.notes),
+        },
+    )
     return {"status": payload.status}
 
 
 @api_router.post("/admin/moderation/{item_id}/ban")
-async def ban_actor_from_moderation(item_id: str, admin: Dict[str, Any] = Depends(require_admin)):
+async def ban_actor_from_moderation(item_id: str, request: Request, admin: Dict[str, Any] = Depends(require_admin)):
     item = await db.moderation_queue.find_one({"id": item_id})
     if not item:
         raise HTTPException(status_code=404, detail="Moderation item not found")
+    item = sanitize_doc(item)
     actor_type = item.get("actor_type")
     actor_id = item.get("actor_id")
+    before_state = {}
+    if actor_type == "user":
+        target_doc = await db.users.find_one({"id": actor_id}, {"_id": 0, "is_banned": 1, "role": 1})
+        before_state = {"is_banned": bool((target_doc or {}).get("is_banned")), "role": (target_doc or {}).get("role")}
+    elif actor_type == "bot":
+        target_doc = await db.bots.find_one({"id": actor_id}, {"_id": 0, "is_banned": 1})
+        before_state = {"is_banned": bool((target_doc or {}).get("is_banned"))}
     if actor_type == "user":
         await db.users.update_one({"id": actor_id}, {"$set": {"is_banned": True, "banned_at": now_iso()}})
     elif actor_type == "bot":
@@ -867,17 +1099,41 @@ async def ban_actor_from_moderation(item_id: str, admin: Dict[str, Any] = Depend
     else:
         raise HTTPException(status_code=400, detail="Unknown actor type")
     await db.moderation_queue.update_one({"id": item_id}, {"$set": {"status": "resolved", "resolved_by": admin["id"]}})
+    await log_audit(
+        f"admin.{actor_type}.ban",
+        "user",
+        admin["id"],
+        payload={
+            **get_request_meta(request),
+            "admin_user_id": admin["id"],
+            "target_user_id": actor_id if actor_type == "user" else None,
+            "target_actor_type": actor_type,
+            "target_actor_id": actor_id,
+            "action": f"{actor_type}.ban",
+            "item_id": item_id,
+            "before": before_state,
+            "after": {"is_banned": True},
+        },
+    )
     await log_alert_event("actor.banned", {"actor_type": actor_type, "actor_id": actor_id, "item_id": item_id})
     return {"status": "banned"}
 
 
 @api_router.post("/admin/moderation/{item_id}/shadow-ban")
-async def shadow_ban_actor_from_moderation(item_id: str, admin: Dict[str, Any] = Depends(require_admin)):
+async def shadow_ban_actor_from_moderation(item_id: str, request: Request, admin: Dict[str, Any] = Depends(require_admin)):
     item = await db.moderation_queue.find_one({"id": item_id})
     if not item:
         raise HTTPException(status_code=404, detail="Moderation item not found")
+    item = sanitize_doc(item)
     actor_type = item.get("actor_type")
     actor_id = item.get("actor_id")
+    before_state = {}
+    if actor_type == "user":
+        target_doc = await db.users.find_one({"id": actor_id}, {"_id": 0, "is_shadow_banned": 1})
+        before_state = {"is_shadow_banned": bool((target_doc or {}).get("is_shadow_banned"))}
+    elif actor_type == "bot":
+        target_doc = await db.bots.find_one({"id": actor_id}, {"_id": 0, "is_shadow_banned": 1})
+        before_state = {"is_shadow_banned": bool((target_doc or {}).get("is_shadow_banned"))}
     updates = {"is_shadow_banned": True, "shadow_ban_reason": get_shadow_ban_reason(), "shadow_banned_at": now_iso()}
     if actor_type == "user":
         await db.users.update_one({"id": actor_id}, {"$set": updates})
@@ -886,6 +1142,22 @@ async def shadow_ban_actor_from_moderation(item_id: str, admin: Dict[str, Any] =
     else:
         raise HTTPException(status_code=400, detail="Unknown actor type")
     await db.moderation_queue.update_one({"id": item_id}, {"$set": {"status": "resolved", "resolved_by": admin["id"]}})
+    await log_audit(
+        f"admin.{actor_type}.shadow_ban",
+        "user",
+        admin["id"],
+        payload={
+            **get_request_meta(request),
+            "admin_user_id": admin["id"],
+            "target_user_id": actor_id if actor_type == "user" else None,
+            "target_actor_type": actor_type,
+            "target_actor_id": actor_id,
+            "action": f"{actor_type}.shadow_ban",
+            "item_id": item_id,
+            "before": before_state,
+            "after": {"is_shadow_banned": True, "shadow_ban_reason": get_shadow_ban_reason()},
+        },
+    )
     await log_alert_event("actor.shadow_banned", {"actor_type": actor_type, "actor_id": actor_id, "item_id": item_id})
     return {"status": "shadow_banned"}
 
@@ -1390,6 +1662,65 @@ async def join_bot_room(slug: str, bot_id: str = Query(...), user: Dict[str, Any
     return {"joined": True}
 
 
+@api_router.get("/rooms/{room_id}/memory")
+async def get_room_memory(room_id: str, user: Dict[str, Any] = Depends(require_active_member)):
+    room = await db.rooms.find_one({"id": room_id})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if not await can_access_room(user, room_id):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    artifacts = await db.artifacts.find(
+        {"room_id": room_id, "kind": {"$in": ["memory_episdodic", "memory_semantic", "memory_episodic"]}},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(20)
+    episodic = next((item for item in artifacts if item.get("kind") in ["memory_episdodic", "memory_episodic"]), None)
+    semantic = next((item for item in artifacts if item.get("kind") == "memory_semantic"), None)
+    await log_room_event(
+        room_id=room_id,
+        event_type="memory.viewed",
+        actor_user_id=user["id"],
+        payload={
+            "has_episodic": bool(episodic),
+            "has_semantic": bool(semantic),
+        },
+    )
+    return {
+        "room_id": room_id,
+        "episodic": sanitize_doc(episodic) if episodic else None,
+        "semantic": sanitize_doc(semantic) if semantic else None,
+    }
+
+
+@api_router.post("/rooms/{room_id}/memory/summarize")
+async def summarize_room_memory(
+    room_id: str,
+    payload: RoomMemorySummarizeRequest,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    room = await db.rooms.find_one({"id": room_id})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if not await can_access_room(user, room_id):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    if os.environ.get("ROOM_SUMMARY_ENABLED", "0") != "1":
+        raise HTTPException(status_code=403, detail="Room summarization is disabled")
+    await enqueue_job(
+        "summarize_room",
+        {
+            "room_id": room_id,
+            "actor_user_id": user["id"],
+            "note": (payload.note or "").strip(),
+        },
+    )
+    await log_room_event(
+        room_id=room_id,
+        event_type="memory.summarize_requested",
+        actor_user_id=user["id"],
+        payload={"queued": True},
+    )
+    return {"status": "queued", "room_id": room_id}
+
+
 @api_router.post("/rooms/{slug}/channels")
 async def create_channel(slug: str, payload: ChannelCreate, user: Dict[str, Any] = Depends(require_active_member)):
     room = await db.rooms.find_one({"slug": slug})
@@ -1509,6 +1840,15 @@ async def post_message(
     await log_audit("message.posted", "user", user["id"], room_id=channel["room_id"], channel_id=channel_id)
     await manager.broadcast(channel_id, {"type": "message_created", "message": message_doc})
     await enqueue_job("index_message", message_doc)
+    if os.environ.get("BOT_AUTO_REPLY", "0") == "1":
+        await enqueue_job(
+            "generate_bot_reply",
+            {
+                "channel_id": channel_id,
+                "user_message_id": message_doc["id"],
+                "user_text": message_doc["content"],
+            },
+        )
     return {"message": message_doc}
 
 
@@ -1920,6 +2260,365 @@ async def update_bounty_status(
     return {"status": payload.status}
 
 
+@api_router.post("/tasks")
+async def create_task(payload: TaskCreate, user: Dict[str, Any] = Depends(require_active_member)):
+    room = await db.rooms.find_one({"id": payload.room_id})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if not await can_access_room(user, payload.room_id):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    now = now_iso()
+    task_doc = {
+        "id": new_id(),
+        "room_id": payload.room_id,
+        "title": payload.title.strip(),
+        "description": (payload.description or "").strip(),
+        "priority": payload.priority,
+        "tags": payload.tags,
+        "state": "open",
+        "created_by_user_id": user["id"],
+        "claimed_by_user_id": None,
+        "assignee_user_id": None,
+        "selected_proposal_id": None,
+        "auto_select_enabled": False,
+        "auto_select_min_votes": 5,
+        "auto_select_margin": 0.2,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.tasks.insert_one(task_doc)
+    await log_task_event(
+        task_doc["id"],
+        task_doc["room_id"],
+        "task.created",
+        user["id"],
+        {"title": task_doc["title"], "priority": task_doc["priority"]},
+    )
+    return {"task": sanitize_doc(task_doc)}
+
+
+@api_router.get("/tasks")
+async def list_tasks(
+    room_id: Optional[str] = None,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    query: Dict[str, Any] = {}
+    if room_id:
+        if not await can_access_room(user, room_id):
+            raise HTTPException(status_code=403, detail="Join the room first")
+        query["room_id"] = room_id
+    elif user.get("role") != "admin":
+        memberships = await db.room_memberships.find(
+            {"member_type": "user", "member_id": user["id"]},
+            {"_id": 0, "room_id": 1},
+        ).to_list(1000)
+        query["room_id"] = {"$in": [m["room_id"] for m in memberships]}
+    tasks = await db.tasks.find(query, {"_id": 0}).sort("updated_at", -1).to_list(500)
+    await log_task_event(
+        task_id="list",
+        room_id=room_id or "all",
+        event_type="task.listed",
+        actor_user_id=user["id"],
+        payload={"count": len(tasks), "room_id": room_id},
+    )
+    return {"items": tasks}
+
+
+@api_router.get("/tasks/{task_id}")
+async def get_task(task_id: str, user: Dict[str, Any] = Depends(require_active_member)):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_access_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    await log_task_event(task["id"], task["room_id"], "task.viewed", user["id"])
+    return {"task": task}
+
+
+@api_router.post("/tasks/{task_id}/claim")
+async def claim_task(task_id: str, user: Dict[str, Any] = Depends(require_active_member)):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_access_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    claimed_by = task.get("claimed_by_user_id")
+    if claimed_by and claimed_by != user["id"]:
+        raise HTTPException(status_code=400, detail="Task already claimed")
+    now = now_iso()
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {"claimed_by_user_id": user["id"], "assignee_user_id": user["id"], "state": "claimed", "updated_at": now}},
+    )
+    await log_task_event(task_id, task["room_id"], "task.claimed", user["id"], {"assignee_user_id": user["id"]})
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"task": updated}
+
+
+@api_router.post("/tasks/{task_id}/assign")
+async def assign_task(
+    task_id: str,
+    payload: TaskAssign,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_manage_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Not allowed to assign tasks")
+    assignee = await db.users.find_one({"id": payload.assignee_user_id})
+    if not assignee:
+        raise HTTPException(status_code=404, detail="Assignee not found")
+    assignee_membership = await db.room_memberships.find_one(
+        {"room_id": task["room_id"], "member_type": "user", "member_id": payload.assignee_user_id}
+    )
+    if not assignee_membership:
+        raise HTTPException(status_code=400, detail="Assignee is not in this room")
+    now = now_iso()
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {"assignee_user_id": payload.assignee_user_id, "state": "assigned", "updated_at": now}},
+    )
+    await log_task_event(
+        task_id,
+        task["room_id"],
+        "task.assigned",
+        user["id"],
+        {"assignee_user_id": payload.assignee_user_id},
+    )
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"task": updated}
+
+
+@api_router.post("/tasks/{task_id}/state")
+async def update_task_state(
+    task_id: str,
+    payload: TaskStateUpdate,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    can_edit = user.get("role") == "admin" or await can_manage_room(user, task["room_id"])
+    if not can_edit and user["id"] not in [task.get("created_by_user_id"), task.get("claimed_by_user_id"), task.get("assignee_user_id")]:
+        raise HTTPException(status_code=403, detail="Not allowed to update task state")
+    now = now_iso()
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {"state": payload.state, "updated_at": now}},
+    )
+    await log_task_event(
+        task_id,
+        task["room_id"],
+        "task.state_changed",
+        user["id"],
+        {"state": payload.state, "note": payload.note},
+    )
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"task": updated}
+
+
+@api_router.post("/tasks/{task_id}/artifacts")
+async def add_task_artifact(
+    task_id: str,
+    payload: TaskArtifactCreate,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_access_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    artifact_doc = {
+        "id": new_id(),
+        "task_id": task_id,
+        "room_id": task["room_id"],
+        "kind": payload.kind,
+        "title": payload.title.strip(),
+        "url": payload.url,
+        "body": payload.body,
+        "metadata": payload.metadata or {},
+        "created_by_user_id": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.artifacts.insert_one(artifact_doc)
+    await db.tasks.update_one({"id": task_id}, {"$set": {"updated_at": now_iso()}})
+    await log_task_event(
+        task_id,
+        task["room_id"],
+        "task.artifact_added",
+        user["id"],
+        {"artifact_id": artifact_doc["id"], "kind": artifact_doc["kind"]},
+    )
+    return {"artifact": sanitize_doc(artifact_doc)}
+
+
+@api_router.post("/tasks/{task_id}/proposals")
+async def create_task_proposal(
+    task_id: str,
+    payload: TaskProposalCreate,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_access_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    proposal_doc = {
+        "id": new_id(),
+        "task_id": task_id,
+        "room_id": task["room_id"],
+        "type": "proposal",
+        "title": payload.title.strip(),
+        "summary": payload.summary.strip(),
+        "steps": [step.strip() for step in payload.steps if step.strip()],
+        "risks": [risk.strip() for risk in payload.risks if risk.strip()],
+        "resources": [resource.model_dump() for resource in payload.resources],
+        "created_by_user_id": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.artifacts.insert_one(proposal_doc)
+    await db.tasks.update_one({"id": task_id}, {"$set": {"updated_at": now_iso()}})
+    await log_task_event(
+        task_id,
+        task["room_id"],
+        "proposal_created",
+        user["id"],
+        {"proposal_id": proposal_doc["id"], "title": proposal_doc["title"]},
+    )
+    return {"proposal": sanitize_doc(proposal_doc)}
+
+
+@api_router.get("/tasks/{task_id}/proposals")
+async def list_task_proposals(task_id: str, user: Dict[str, Any] = Depends(require_active_member)):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_access_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    proposals = await db.artifacts.find(
+        {"task_id": task_id, "type": "proposal"},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(200)
+    vote_events = await db.task_events.find(
+        {"task_id": task_id, "event_type": "vote_cast"},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(5000)
+    tally: Dict[str, Dict[str, int]] = {}
+    my_votes: Dict[str, str] = {}
+    latest_votes: Dict[str, Dict[str, str]] = {}
+    for event_doc in vote_events:
+        payload = event_doc.get("payload", {})
+        proposal_id = payload.get("proposal_id")
+        vote_value = payload.get("vote")
+        actor_id = payload.get("actor_id")
+        if not proposal_id:
+            continue
+        if vote_value not in ("up", "down") or not actor_id:
+            continue
+        latest_votes.setdefault(proposal_id, {})[actor_id] = vote_value
+    for proposal_id, actor_votes in latest_votes.items():
+        counts = {"up": 0, "down": 0}
+        for actor_id, vote_value in actor_votes.items():
+            counts[vote_value] += 1
+            if actor_id == user["id"]:
+                my_votes[proposal_id] = vote_value
+        tally[proposal_id] = counts
+    for proposal in proposals:
+        proposal["votes"] = tally.get(proposal["id"], {"up": 0, "down": 0})
+        proposal["my_vote"] = my_votes.get(proposal["id"])
+        proposal["selected"] = proposal["id"] == task.get("selected_proposal_id")
+    await log_task_event(
+        task_id,
+        task["room_id"],
+        "proposal_listed",
+        user["id"],
+        {"count": len(proposals)},
+    )
+    proposals.reverse()
+    return {"items": proposals}
+
+
+@api_router.post("/tasks/{task_id}/votes")
+async def cast_task_vote(
+    task_id: str,
+    payload: TaskVoteCreate,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    if payload.vote not in ["up", "down"]:
+        raise HTTPException(status_code=400, detail="vote must be up or down")
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_access_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    proposal = await db.artifacts.find_one({"id": payload.proposal_id, "task_id": task_id, "type": "proposal"})
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    await log_task_event(
+        task_id,
+        task["room_id"],
+        "vote_cast",
+        user["id"],
+        {"proposal_id": payload.proposal_id, "vote": payload.vote, "actor_id": user["id"]},
+    )
+    return {"status": "ok"}
+
+
+@api_router.post("/tasks/{task_id}/proposals/{proposal_id}/select")
+async def select_task_proposal(
+    task_id: str,
+    proposal_id: str,
+    user: Dict[str, Any] = Depends(require_active_member),
+):
+    if not (user.get("is_admin") or user.get("role") == "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    proposal = await db.artifacts.find_one({"id": proposal_id, "task_id": task_id, "type": "proposal"})
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {"selected_proposal_id": proposal_id, "updated_at": now_iso()}},
+    )
+    await log_task_event(
+        task_id,
+        task["room_id"],
+        "proposal_selected",
+        user["id"],
+        {"proposal_id": proposal_id},
+    )
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"task": updated}
+
+
+@api_router.get("/tasks/{task_id}/events")
+async def get_task_events(task_id: str, user: Dict[str, Any] = Depends(require_active_member)):
+    task = await db.tasks.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = sanitize_doc(task)
+    if not await can_access_room(user, task["room_id"]):
+        raise HTTPException(status_code=403, detail="Join the room first")
+    events = await db.task_events.find({"task_id": task_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    artifacts = await db.artifacts.find({"task_id": task_id}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    await log_task_event(task_id, task["room_id"], "task.events_viewed", user["id"], {"count": len(events)})
+    events.reverse()
+    artifacts.reverse()
+    return {"items": events, "artifacts": artifacts}
+
+
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket, channelId: str, token: Optional[str] = None):
     token = token or websocket.cookies.get("spark_token")
@@ -1975,6 +2674,18 @@ async def startup_tasks():
         redis_pool = await create_pool(redis_settings)
     except Exception as error:
         logger.warning("Redis not available: %s", error)
+    try:
+        await db.tasks.create_index("id", unique=True)
+        await db.tasks.create_index([("room_id", 1), ("updated_at", -1)])
+        await db.artifacts.create_index("id", unique=True)
+        await db.artifacts.create_index([("task_id", 1), ("created_at", -1)])
+        await db.artifacts.create_index([("room_id", 1), ("kind", 1), ("created_at", -1)])
+        await db.task_events.create_index("id", unique=True)
+        await db.task_events.create_index([("task_id", 1), ("created_at", -1)])
+        await db.room_events.create_index("id", unique=True)
+        await db.room_events.create_index([("room_id", 1), ("created_at", -1)])
+    except Exception as error:
+        logger.warning("Task index setup failed: %s", error)
 
 
 @app.on_event("shutdown")
