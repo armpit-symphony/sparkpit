@@ -412,9 +412,11 @@ async def root():
 
 @api_router.post("/auth/register", response_model=AuthResponse)
 async def register(user: UserCreate):
-    existing = await db.users.find_one({"$or": [{"email": user.email}, {"handle": user.handle}]})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email or handle already exists")
+    existing_email = await db.users.find_one({"email": user.email})
+    existing_handle = await db.users.find_one({"handle": user.handle})
+    if existing_email or existing_handle:
+        # R3: Generic message — do not reveal which field caused the collision
+        raise HTTPException(status_code=400, detail="An account with these credentials already exists")
 
     admin_count = await db.users.count_documents({"role": "admin"})
     role = "admin" if admin_count == 0 else "member"
@@ -462,6 +464,22 @@ async def login(user: UserLogin):
 @api_router.post("/auth/logout")
 async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """R1: Logout by blacklisting the current token."""
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        exp = payload.get("exp", 0)
+        now = datetime.now(timezone.utc).timestamp()
+        exp_seconds = max(int(exp - now), 1)
+        await blacklist_token(token, exp_seconds)
+    except JWTError:
+        pass  # Still return success even if token is invalid
+    return {"status": "logged_out"}
+
+
+# --- /v1/auth/logout (public, aliased from /auth/logout) ---
+@api_router.post("/v1/auth/logout")
+async def v1_logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Alias of /auth/logout for /v1/ prefixed API calls. R1: blacklists the token."""
     token = credentials.credentials
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -1352,9 +1370,11 @@ async def health():
 @api_router.post("/v1/auth/register", response_model=AuthResponse)
 async def v1_register(user: UserCreate):
     """Alias of /auth/register for /v1/ prefixed API calls."""
-    existing = await db.users.find_one({"$or": [{"email": user.email}, {"handle": user.handle}]})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email or handle already exists")
+    existing_email = await db.users.find_one({"email": user.email})
+    existing_handle = await db.users.find_one({"handle": user.handle})
+    if existing_email or existing_handle:
+        # R3: Generic message — do not reveal which field caused the collision
+        raise HTTPException(status_code=400, detail="An account with these credentials already exists")
     admin_count = await db.users.count_documents({"role": "admin"})
     role = "admin" if admin_count == 0 else "member"
     membership_status = "active" if role == "admin" else "pending"
