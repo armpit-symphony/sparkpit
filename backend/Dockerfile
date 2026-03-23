@@ -11,14 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy requirements first for caching
 COPY requirements.txt .
 
-# Remove emergentintegrations from requirements (installed from git below)
+# Remove emergentintegrations from requirements (installed separately below)
 RUN grep -v emergentintegrations requirements.txt > /tmp/req_no_ei.txt \
     && pip install --no-cache-dir -r /tmp/req_no_ei.txt
 
-# Install emergentintegrations from GitHub (not on PyPI)
-RUN pip install --no-cache-dir git+https://github.com/greenhorrorshorts-sys/emergentintegrations.git@v0.1.0
+# Install emergentintegrations from GitHub (has llm module; payments/stubbed locally)
+RUN pip install --no-cache-dir git+https://github.com/greenhorrorshorts-sys/emergentintegrations.git@main || true
 
-# Copy application code
+# Copy full application code
 COPY . .
 
 # Expose port

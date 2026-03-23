@@ -1296,17 +1296,62 @@ async def websocket_endpoint(websocket: WebSocket, channelId: str):
         manager.disconnect(channelId, websocket)
 
 
-# --- /v1/health endpoint (public, no auth required) ---
-@app.get("/v1/health")
-async def v1_health():
-    """Public health check — used by nginx /v1/ proxy to verify service is up."""
-    mongo_ok = False
-    try:
-        await client.admin.command("ping")
-        mongo_ok = True
-    except Exception:
-        pass
-    return {"status": "ok", "version": "1.0.0", "mongo": "ok" if mongo_ok else "degraded"}
+# --- /health endpoint (public, no auth required) ---
+# nginx strips /v1 prefix: /v1/health -> /health
+@app.get("/health")
+async def health():
+    """Public health check — fast, no DB required."""
+    return {"status": "ok", "version": "1.0.0"}
+
+# --- /v1/auth/register (public, aliased from /auth/register) ---
+@api_router.post("/v1/auth/register", response_model=AuthResponse)
+async def v1_register(user: UserCreate):
+    """Alias of /auth/register for /v1/ prefixed API calls."""
+    existing = await db.users.find_one({"$or": [{"email": user.email}, {"handle": user.handle}]})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email or handle already exists")
+    admin_count = await db.users.count_documents({"role": "admin"})
+    role = "admin" if admin_count == 0 else "member"
+    membership_status = "active" if role == "admin" else "pending"
+    now = now_iso()
+    user_doc = {
+        "id": new_id(),
+        "email": user.email,
+        "handle": user.handle,
+        "password_hash": hash_password(user.password),
+        "role": role,
+        "membership_status": membership_status,
+        "joined_at": now if membership_status == "active" else None,
+        "membership_activated_at": now if membership_status == "active" else None,
+        "stripe_customer_id": None,
+        "stripe_session_id": None,
+        "stripe_session_status": None,
+        "reputation": {
+            "bounties_claimed": 0,
+            "bounties_submitted": 0,
+            "bounties_approved": 0,
+            "completion_rate": 0.0,
+        },
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.users.insert_one(user_doc)
+    user_doc = sanitize_doc(user_doc)
+    token = create_token(user_doc)
+    user_doc.pop("password_hash", None)
+    return {"token": token, "user": user_doc}
+
+# --- /v1/auth/login (public, aliased from /auth/login) ---
+@api_router.post("/v1/auth/login", response_model=AuthResponse)
+async def v1_login(user: UserLogin):
+    """Alias of /auth/login for /v1/ prefixed API calls."""
+    existing = await db.users.find_one({"email": user.email})
+    if not existing or not verify_password(user.password, existing.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+    existing = sanitize_doc(existing)
+    token = create_token(existing)
+    existing.pop("password_hash", None)
+    return {"token": token, "user": existing}
 
 
 app.include_router(api_router)

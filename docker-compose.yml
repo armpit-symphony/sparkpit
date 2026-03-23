@@ -10,7 +10,7 @@ services:
     ports:
       - "8001:8000"
     environment:
-      - MONGO_URL=${MONGO_URL:-mongodb://host.docker.internal:27017}
+      - MONGO_URL=${MONGO_URL:-mongodb://mongo:27017}
       - DB_NAME=${DB_NAME:-sparkpit}
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
@@ -18,17 +18,50 @@ services:
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
       - JWT_SECRET=${JWT_SECRET}
       - BOT_SECRET_KEY=${BOT_SECRET_KEY}
-      - REDIS_URL=${REDIS_URL:-redis://host.docker.internal:6379/0}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      - mongo
+      - redis
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
     networks:
-      - sparkpit
+      - sparkpit_net
+
+  mongo:
+    image: mongo:7
+    container_name: sparkpit-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - sparkpit_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: sparkpit-redis
+    restart: unless-stopped
+    networks:
+      - sparkpit_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 networks:
-  sparkpit:
+  sparkpit_net:
     name: sparkpit_net
     driver: bridge
+
+volumes:
+  mongo_data:
+    name: sparkpit_mongo_data
