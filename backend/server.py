@@ -48,6 +48,29 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 redis_settings = RedisSettings.from_dsn(REDIS_URL)
 redis_pool = None
 
+BLACKLIST_PREFIX = "token_blacklist:"
+
+
+async def is_token_blacklisted(token: str) -> bool:
+    """Check if a token is blacklisted."""
+    if not redis_pool:
+        return False
+    try:
+        result = await redis_pool.get(f"{BLACKLIST_PREFIX}{token}")
+        return result is not None
+    except Exception:
+        return False
+
+
+async def blacklist_token(token: str, exp_seconds: int) -> None:
+    """Add a token to the blacklist until it expires."""
+    if not redis_pool:
+        return
+    try:
+        await redis_pool.set(f"{BLACKLIST_PREFIX}{token}", "1", ex=exp_seconds)
+    except Exception:
+        pass
+
 ACTIVITY_EVENTS = [
     "room.created",
     "room.joined",
@@ -320,6 +343,9 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("sub")
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    # R1: Check if token is blacklisted
+    if await is_token_blacklisted(token):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
     user = await db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
@@ -417,8 +443,8 @@ async def register(user: UserCreate):
     }
     await db.users.insert_one(user_doc)
     user_doc = sanitize_doc(user_doc)
+    user_doc.pop("password_hash", None)  # R3: Remove password_hash BEFORE creating token
     token = create_token(user_doc)
-    user_doc.pop("password_hash", None)
     return {"token": token, "user": user_doc}
 
 
@@ -428,9 +454,24 @@ async def login(user: UserLogin):
     if not existing or not verify_password(user.password, existing.get("password_hash", "")):
         raise HTTPException(status_code=400, detail="Invalid credentials")
     existing = sanitize_doc(existing)
+    existing.pop("password_hash", None)  # R3: Remove before token creation
     token = create_token(existing)
-    existing.pop("password_hash", None)
     return {"token": token, "user": existing}
+
+
+@api_router.post("/auth/logout")
+async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """R1: Logout by blacklisting the current token."""
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        exp = payload.get("exp", 0)
+        now = datetime.now(timezone.utc).timestamp()
+        exp_seconds = max(int(exp - now), 1)
+        await blacklist_token(token, exp_seconds)
+    except JWTError:
+        pass  # Still return success even if token is invalid
+    return {"status": "logged_out"}
 
 
 @api_router.post("/auth/invite/claim")
@@ -852,7 +893,11 @@ async def get_room(slug: str, user: Dict[str, Any] = Depends(require_active_memb
         {"room_id": room["id"], "member_type": "user", "member_id": user["id"]}
     )
     membership = sanitize_doc(membership) if membership else None
-    channels = await db.channels.find({"room_id": room["id"]}, {"_id": 0}).to_list(200)
+    # R2: Only return channels if user is a room member
+    if membership:
+        channels = await db.channels.find({"room_id": room["id"]}, {"_id": 0}).to_list(200)
+    else:
+        channels = []
     return {"room": room, "channels": channels, "membership": membership}
 
 
@@ -1337,8 +1382,8 @@ async def v1_register(user: UserCreate):
     }
     await db.users.insert_one(user_doc)
     user_doc = sanitize_doc(user_doc)
+    user_doc.pop("password_hash", None)  # R3: Remove password_hash BEFORE creating token
     token = create_token(user_doc)
-    user_doc.pop("password_hash", None)
     return {"token": token, "user": user_doc}
 
 # --- /v1/auth/login (public, aliased from /auth/login) ---
