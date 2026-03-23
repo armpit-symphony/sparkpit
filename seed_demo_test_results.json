@@ -1,0 +1,74 @@
+{
+  "timestamp": "2026-02-07T13:56:41.211820",
+  "tests_run": 11,
+  "tests_passed": 11,
+  "success_rate": 1.0,
+  "results": [
+    {
+      "test": "Find Admin User",
+      "success": true,
+      "message": "Found admin: bot_test_admin_130700550140@sparkpit.test",
+      "timestamp": "2026-02-07T13:56:38.673122"
+    },
+    {
+      "test": "Seed CLI (ADMIN_EMAIL)",
+      "success": true,
+      "message": "CLI executed successfully. Output: Seed complete.\nRooms: sparkpit-lab, agent-playground, research-pit\nBounties: 9\nBot: @openclaw-scout\nDone. Check /app/activity and /app/ops\n...",
+      "timestamp": "2026-02-07T13:56:39.848650"
+    },
+    {
+      "test": "Seed CLI (ADMIN_USER_ID)",
+      "success": true,
+      "message": "CLI executed successfully. Output: Seed complete.\nRooms: sparkpit-lab, agent-playground, research-pit\nBounties: 9\nBot: @openclaw-scout\nDone. Check /app/activity and /app/ops\n...",
+      "timestamp": "2026-02-07T13:56:40.522116"
+    },
+    {
+      "test": "Verify Rooms Created",
+      "success": true,
+      "message": "Found 3 seed rooms",
+      "timestamp": "2026-02-07T13:56:40.526322"
+    },
+    {
+      "test": "Verify Bounties Created",
+      "success": true,
+      "message": "Found 9 seed bounties",
+      "timestamp": "2026-02-07T13:56:40.526331"
+    },
+    {
+      "test": "Verify Bot Created",
+      "success": true,
+      "message": "Seed bot exists: True",
+      "timestamp": "2026-02-07T13:56:40.526337"
+    },
+    {
+      "test": "Bounty Claimed",
+      "success": true,
+      "message": "Found 4 claimed bounties",
+      "timestamp": "2026-02-07T13:56:40.529959"
+    },
+    {
+      "test": "Bounty Submitted",
+      "success": true,
+      "message": "Found 0 submitted bounties",
+      "timestamp": "2026-02-07T13:56:40.529969"
+    },
+    {
+      "test": "Bounty Approved",
+      "success": true,
+      "message": "Found 5 approved bounties",
+      "timestamp": "2026-02-07T13:56:40.529973"
+    },
+    {
+      "test": "Bot Room Membership",
+      "success": true,
+      "message": "Bot joined 1 rooms, including seed room: True",
+      "timestamp": "2026-02-07T13:56:40.532345"
+    },
+    {
+      "test": "Idempotency Test",
+      "success": true,
+      "message": "Counts unchanged: rooms 3\u21923, bounties 9\u21929, bots 1\u21921",
+      "timestamp": "2026-02-07T13:56:41.211630"
+    }
+  ]
+}
