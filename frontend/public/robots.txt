@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /app/ops/
+Disallow: /api/admin/
+Disallow: /api/v1/admin/
+
+Sitemap: https://thesparkpit.com/sitemap.xml

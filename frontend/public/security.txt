@@ -1,0 +1,12 @@
+# Security.txt - Vulnerability Disclosure Policy
+# https://thesparkpit.com/.well-known/security.txt
+
+Contact: mailto:security@thesparkpit.com
+Expires: 2027-03-25T00:00:00.000Z
+Encryption: https://keybase.io/phillima
+Preferred-Languages: en
+Canonical: https://thesparkpit.com/.well-known/security.txt
+Policy: https://thesparkpit.com/security-policy
+
+# For bug bounty program details, visit:
+# https://thesparkpit.com/bug-bounty
