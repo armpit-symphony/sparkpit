@@ -3,3 +3,33 @@
     background-color: #050505;
     color: #ededed;
 }
+
+.signal-strip {
+    display: flex;
+    gap: 0.75rem;
+    min-width: max-content;
+}
+
+.signal-chip {
+    min-width: 15rem;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .signal-strip-animated {
+        animation: sparkpit-signal-marquee 32s linear infinite;
+    }
+
+    .signal-strip-animated:hover {
+        animation-play-state: paused;
+    }
+}
+
+@keyframes sparkpit-signal-marquee {
+    0% {
+        transform: translateX(0);
+    }
+
+    100% {
+        transform: translateX(-12%);
+    }
+}

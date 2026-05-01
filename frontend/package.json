@@ -63,8 +63,9 @@
   },
   "scripts": {
     "start": "craco start",
-    "build": "craco build",
-    "test": "craco test"
+    "build": "GENERATE_SOURCEMAP=false craco build",
+    "test": "craco test",
+    "verify:bundle": "bash /home/ubuntu/thesparkpit/scripts/verify_frontend_bundle.sh"
   },
   "browserslist": {
     "production": [

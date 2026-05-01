@@ -6,15 +6,39 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
 import { toast } from "@/components/ui/sonner";
+import { AdminStatusCards } from "@/components/admin/AdminStatusCards";
+import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
+import { InviteManagementPanel } from "@/components/admin/InviteManagementPanel";
 
 export default function Settings() {
   const { user, refresh, logout } = useAuth();
   const { setSecondaryPanel } = useLayout();
   const [handle, setHandle] = useState(user?.handle || "");
-  const [inviteCode, setInviteCode] = useState(null);
-  const [maxUses, setMaxUses] = useState(1);
   const [auditEvents, setAuditEvents] = useState([]);
   const isAdmin = user?.role === "admin";
+  const adminSummaryItems = [
+    {
+      id: "role",
+      label: "Admin access",
+      detail: isAdmin ? "Enabled for invites, moderation, ops, and audit." : "Standard member access only.",
+      ok: isAdmin,
+      eyebrow: "Role",
+    },
+    {
+      id: "invites",
+      label: "Invite console",
+      detail: isAdmin ? "Inventory, generation, and copy controls are available." : "Invite management restricted to admins.",
+      ok: isAdmin,
+      eyebrow: "Access",
+    },
+    {
+      id: "audit",
+      label: "Audit visibility",
+      detail: isAdmin ? `${auditEvents.length} recent admin-visible events loaded.` : "Audit feed restricted to admins.",
+      ok: isAdmin && auditEvents.length > 0,
+      eyebrow: "Audit",
+    },
+  ];
 
   useEffect(() => {
     setSecondaryPanel(<QuickPanel />);
@@ -31,18 +55,6 @@ export default function Settings() {
       toast.success("Profile updated.");
     } catch (error) {
       toast.error("Unable to update profile.");
-    }
-  };
-
-  const generateInvite = async () => {
-    try {
-      const response = await api.post("/admin/invite-codes", {
-        max_uses: Number(maxUses),
-      });
-      setInviteCode(response.data.invite_code.code);
-      toast.success("Invite generated.");
-    } catch (error) {
-      toast.error("Unable to generate invite.");
     }
   };
 
@@ -63,15 +75,17 @@ export default function Settings() {
 
   return (
     <div className="flex h-full flex-col" data-testid="settings-page">
-      <div className="border-b border-zinc-800 bg-zinc-950/70 px-6 py-4">
-        <div className="text-xs font-mono uppercase tracking-[0.3em] text-zinc-500">Settings</div>
-        <div className="text-lg font-semibold" data-testid="settings-title">
-          Profile control
-        </div>
-      </div>
-
       <div className="flex-1 overflow-y-auto p-6">
-        <div className="grid gap-6 lg:grid-cols-[1.2fr_1fr]">
+        <AdminPageHeader
+          eyebrow="Settings"
+          title="Profile control"
+          titleTestId="settings-title"
+          description="Manage account settings and, when permitted, the admin surfaces tied to invites and audit visibility."
+          adminNote={user?.email}
+          meta="Profile edits • session control • admin access surfaces"
+        />
+
+        <div className="mt-6 grid gap-6 lg:grid-cols-[1.2fr_1fr]">
           <div className="space-y-6">
             <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-5" data-testid="profile-card">
               <div className="text-sm font-semibold">Profile</div>
@@ -80,7 +94,7 @@ export default function Settings() {
                   Email: {user?.email}
                 </div>
                 <div className="text-xs text-zinc-500" data-testid="profile-membership">
-                  Membership: {user?.membership_status}
+                  Access: open
                 </div>
                 <Input
                   value={handle}
@@ -112,37 +126,17 @@ export default function Settings() {
           </div>
 
           <div className="space-y-6" id="audit">
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-5" data-testid="invite-card">
-              <div className="text-sm font-semibold">Admin: Invite codes</div>
-              <div className="mt-3 text-xs text-zinc-500">
-                Only admins can generate codes.
+            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-5">
+              <div className="text-sm font-semibold">Admin surface</div>
+              <div className="mt-2 text-xs text-zinc-500">
+                Invite controls and audit visibility share the same admin access boundary.
               </div>
-              <div className="mt-4 flex gap-2">
-                <Input
-                  value={maxUses}
-                  onChange={(event) => setMaxUses(event.target.value)}
-                  className="w-24 rounded-none border-zinc-800 bg-zinc-950 font-mono"
-                  disabled={!isAdmin}
-                  data-testid="invite-max-uses-input"
-                />
-                <Button
-                  onClick={generateInvite}
-                  className="rounded-none bg-cyan-500 text-black hover:bg-cyan-400"
-                  disabled={!isAdmin}
-                  data-testid="invite-generate-button"
-                >
-                  Generate
-                </Button>
+              <div className="mt-4">
+                <AdminStatusCards items={adminSummaryItems} testId="settings-admin-summary" />
               </div>
-              {inviteCode && (
-                <div
-                  className="mt-3 rounded-none border border-amber-500/30 bg-amber-500/10 p-2 font-mono text-xs text-amber-300"
-                  data-testid="invite-code-display"
-                >
-                  {inviteCode}
-                </div>
-              )}
             </div>
+
+            <InviteManagementPanel isAdmin={isAdmin} />
 
             <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-5" data-testid="audit-card">
               <div className="text-sm font-semibold">Audit feed</div>

@@ -100,6 +100,15 @@ h4 {
     letter-spacing: -0.02em;
 }
 
+.hero-logo {
+    position: absolute;
+    top: 40px;
+    left: 60px;
+    width: 150px;
+    height: auto;
+    z-index: 10;
+}
+
 @layer base {
     [data-debug-wrapper="true"] {
         display: contents !important;
@@ -129,5 +138,65 @@ h4 {
         border-right-color: inherit;
         border-top-color: inherit;
         border-bottom-color: inherit;
+    }
+}
+
+@keyframes lobby-signal-marquee {
+    from {
+        transform: translate3d(0, 0, 0);
+    }
+    to {
+        transform: translate3d(calc(-50% - (var(--signal-gap) / 2)), 0, 0);
+    }
+}
+
+.lobby-signal-ticker {
+    --signal-gap: 0.75rem;
+    position: relative;
+}
+
+.lobby-signal-ticker::before,
+.lobby-signal-ticker::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2.5rem;
+    pointer-events: none;
+    z-index: 1;
+}
+
+.lobby-signal-ticker::before {
+    left: 0;
+    background: linear-gradient(90deg, rgba(5, 5, 5, 0.92), rgba(5, 5, 5, 0));
+}
+
+.lobby-signal-ticker::after {
+    right: 0;
+    background: linear-gradient(270deg, rgba(5, 5, 5, 0.92), rgba(5, 5, 5, 0));
+}
+
+.lobby-signal-track {
+    display: flex;
+    gap: var(--signal-gap);
+    width: max-content;
+    padding: 0.75rem;
+    animation: lobby-signal-marquee 34s linear infinite;
+    will-change: transform;
+}
+
+.lobby-signal-ticker:hover .lobby-signal-track,
+.lobby-signal-ticker:focus-within .lobby-signal-track {
+    animation-play-state: paused;
+}
+
+.lobby-signal-chip {
+    min-height: 4rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .lobby-signal-track {
+        animation: none;
+        transform: none;
     }
 }

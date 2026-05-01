@@ -4,31 +4,17 @@ import { QuickPanel } from "@/components/layout/QuickPanel";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/context/AuthContext";
+import { AdminStatusCards } from "@/components/admin/AdminStatusCards";
+import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
+import { StripeSettingsPanel } from "@/components/admin/StripeSettingsPanel";
 
-const statusLabel = (value) => (value ? "OK" : "Not set");
+const statusLabel = (value) => (value ? "OK" : "Attention needed");
 
 export default function OpsChecklist() {
   const { setSecondaryPanel } = useLayout();
   const { user } = useAuth();
   const [ops, setOps] = useState(null);
   const [error, setError] = useState("");
-  const [moderationItems, setModerationItems] = useState([]);
-  const [moderationStatus, setModerationStatus] = useState("queued");
-  const [moderationError, setModerationError] = useState("");
-  const [moderationLoading, setModerationLoading] = useState(false);
-  const [moderationActorType, setModerationActorType] = useState("");
-  const [moderationContentType, setModerationContentType] = useState("");
-  const [moderationActorId, setModerationActorId] = useState("");
-  const [moderationRoomId, setModerationRoomId] = useState("");
-  const [moderationChannelId, setModerationChannelId] = useState("");
-  const [moderationBountyId, setModerationBountyId] = useState("");
-  const [rooms, setRooms] = useState([]);
-  const [channels, setChannels] = useState([]);
-  const [bounties, setBounties] = useState([]);
-  const [roomSearch, setRoomSearch] = useState("");
-  const [channelSearch, setChannelSearch] = useState("");
-  const [bountySearch, setBountySearch] = useState("");
-  const [lookupError, setLookupError] = useState("");
   const [rateLimitEvents, setRateLimitEvents] = useState([]);
   const [rateLimitAvailable, setRateLimitAvailable] = useState(false);
   const [alerts, setAlerts] = useState([]);
@@ -41,18 +27,6 @@ export default function OpsChecklist() {
       setOps(response.data);
     } catch (err) {
       setError("Admin access required or ops endpoint unavailable.");
-    }
-  };
-
-  const loadLookups = async () => {
-    try {
-      setLookupError("");
-      const response = await api.get("/admin/lookups", { params: { limit: 50 } });
-      setRooms(response.data.rooms_recent || []);
-      setChannels(response.data.channels_recent || []);
-      setBounties(response.data.bounties_recent || []);
-    } catch (err) {
-      setLookupError("Unable to load room/channel/bounty lookups.");
     }
   };
 
@@ -78,81 +52,90 @@ export default function OpsChecklist() {
     }
   };
 
-  const loadChannelsForRoom = async (roomId) => {
-    if (!roomId) {
-      setChannels([]);
-      return;
-    }
-    setChannels((prev) => prev.filter((channel) => channel.room_id === roomId));
-  };
-
-  const loadModeration = async (status = moderationStatus) => {
-    try {
-      setModerationError("");
-      setModerationLoading(true);
-      const response = await api.get("/admin/moderation", {
-        params: {
-          status,
-          actor_type: moderationActorType || undefined,
-          content_type: moderationContentType || undefined,
-          actor_id: moderationActorId || undefined,
-          room_id: moderationRoomId || undefined,
-          channel_id: moderationChannelId || undefined,
-          bounty_id: moderationBountyId || undefined,
-        },
-      });
-      setModerationItems(response.data.items || []);
-    } catch (err) {
-      setModerationError("Unable to load moderation queue.");
-    } finally {
-      setModerationLoading(false);
-    }
-  };
-
-  const resolveItem = async (itemId, status) => {
-    try {
-      await api.post(`/admin/moderation/${itemId}/resolve`, { status });
-      await loadModeration();
-    } catch (err) {
-      setModerationError("Unable to resolve moderation item.");
-    }
-  };
-
   useEffect(() => {
     setSecondaryPanel(<QuickPanel />);
   }, [setSecondaryPanel]);
 
   useEffect(() => {
     loadOps();
-    loadModeration();
-    loadLookups();
     loadRateLimits();
     loadAlerts();
   }, []);
 
+  const checks = [
+    {
+      id: "stripe",
+      label: "Stripe configured",
+      detail: statusLabel(ops?.stripe_configured),
+      ok: !!ops?.stripe_configured,
+    },
+    {
+      id: "webhook",
+      label: "Stripe webhook",
+      detail: ops?.stripe_webhook_last_received
+        ? `Last received ${new Date(ops.stripe_webhook_last_received).toLocaleString()}`
+        : "Awaiting first webhook",
+      ok: !!ops?.stripe_webhook_last_received,
+    },
+    {
+      id: "membership-price",
+      label: "Membership price ID",
+      detail: statusLabel(ops?.stripe_membership_price_configured),
+      ok: !!ops?.stripe_membership_price_configured,
+    },
+    {
+      id: "bot-invite-price",
+      label: "Bot invite price ID",
+      detail: statusLabel(ops?.stripe_bot_invite_price_configured),
+      ok: !!ops?.stripe_bot_invite_price_configured,
+    },
+    {
+      id: "redis",
+      label: "Redis connectivity",
+      detail: statusLabel(ops?.redis_connected),
+      ok: !!ops?.redis_connected,
+    },
+    {
+      id: "worker",
+      label: "Worker heartbeat",
+      detail: ops?.worker_healthy ? "Healthy in the last minute" : "Stale or missing heartbeat",
+      ok: !!ops?.worker_healthy,
+    },
+  ];
+
   return (
     <div className="flex h-full flex-col" data-testid="ops-page">
-      <div className="border-b border-zinc-800 bg-zinc-950/70 px-6 py-4">
-        <div className="text-xs font-mono uppercase tracking-[0.3em] text-zinc-500">Ops Checklist</div>
-        <div className="text-lg font-semibold" data-testid="ops-title">
-          Launch readiness
-        </div>
-      </div>
-
       <div className="flex-1 overflow-y-auto p-6">
-        <div className="flex items-center justify-between">
-          <div className="text-xs text-zinc-500" data-testid="ops-admin-note">
-            Admin only · {user?.email}
-          </div>
-          <Button
-            onClick={loadOps}
-            className="rounded-none border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
-            variant="outline"
-            data-testid="ops-refresh"
-          >
-            Refresh
-          </Button>
-        </div>
+        <AdminPageHeader
+          eyebrow="Ops Console"
+          title="System readiness and launch health"
+          titleTestId="ops-title"
+          description="Track platform dependencies, worker health, and abuse telemetry before you push work live."
+          adminNote={`Admin only · ${user?.email}`}
+          meta="Launch readiness • platform health • incident telemetry"
+          actions={
+            <>
+              <Button
+                onClick={loadRateLimits}
+                className="rounded-none border border-zinc-700 text-zinc-300 hover:bg-zinc-900"
+                variant="outline"
+              >
+                Refresh telemetry
+              </Button>
+              <Button
+                onClick={() => {
+                  loadOps();
+                  loadAlerts();
+                }}
+                className="rounded-none border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
+                variant="outline"
+                data-testid="ops-refresh"
+              >
+                Refresh checks
+              </Button>
+            </>
+          }
+        />
 
         {error && (
           <div className="mt-4 rounded-none border border-pink-500/40 bg-pink-500/10 p-3 text-xs text-pink-300" data-testid="ops-error">
@@ -160,302 +143,37 @@ export default function OpsChecklist() {
           </div>
         )}
 
-        {ops && (
-          <div className="mt-6 space-y-3" data-testid="ops-list">
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-4" data-testid="ops-stripe-configured">
-              <div className="text-sm font-semibold">Stripe configured</div>
-              <div className="mt-2 text-xs text-zinc-400">{statusLabel(ops.stripe_configured)}</div>
-            </div>
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-4" data-testid="ops-stripe-webhook">
-              <div className="text-sm font-semibold">Stripe webhook</div>
-              <div className="mt-2 text-xs text-zinc-400">
-                {ops.stripe_webhook_last_received
-                  ? `Last received: ${new Date(ops.stripe_webhook_last_received).toLocaleString()}`
-                  : "Awaiting first webhook"}
-              </div>
-            </div>
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-4" data-testid="ops-redis">
-              <div className="text-sm font-semibold">Redis connectivity</div>
-              <div className="mt-2 text-xs text-zinc-400">{statusLabel(ops.redis_connected)}</div>
-            </div>
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-4" data-testid="ops-worker">
-              <div className="text-sm font-semibold">Worker heartbeat</div>
-              <div className="mt-2 text-xs text-zinc-400">
-                {ops.worker_healthy
-                  ? "Healthy (last 60s)"
-                  : "Stale or missing"}
+        <div className="mt-6 grid gap-4 xl:grid-cols-[1.3fr_0.7fr]">
+          <AdminStatusCards items={checks} testId="ops-list" />
+
+          <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-5">
+            <div className="text-xs font-mono uppercase tracking-[0.24em] text-zinc-500">Console scope</div>
+            <div className="mt-3 space-y-3 text-sm text-zinc-300">
+              <div>Use Ops for launch readiness, service health, and platform-level abuse signals.</div>
+              <div className="rounded-none border border-zinc-800 bg-zinc-950/60 p-3 text-xs text-zinc-400">
+                Moderation review now lives in its own console so trust and safety triage does not compete with system checks.
               </div>
             </div>
           </div>
-        )}
-
-        <div className="mt-10 border-t border-zinc-800 pt-6" data-testid="ops-moderation">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-xs font-mono uppercase tracking-[0.3em] text-zinc-500">Moderation</div>
-              <div className="text-lg font-semibold">Queue</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                onClick={() => {
-                  setModerationStatus("queued");
-                  loadModeration("queued");
-                }}
-                className={`rounded-none border ${moderationStatus === "queued" ? "border-cyan-500 text-cyan-300" : "border-zinc-700 text-zinc-300"} hover:bg-cyan-500/10`}
-                variant="outline"
-              >
-                Queued
-              </Button>
-              <Button
-                onClick={() => {
-                  setModerationStatus("resolved");
-                  loadModeration("resolved");
-                }}
-                className={`rounded-none border ${moderationStatus === "resolved" ? "border-cyan-500 text-cyan-300" : "border-zinc-700 text-zinc-300"} hover:bg-cyan-500/10`}
-                variant="outline"
-              >
-                Resolved
-              </Button>
-              <Button
-                onClick={() => loadModeration()}
-                className="rounded-none border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
-                variant="outline"
-              >
-                Refresh
-              </Button>
-            </div>
-          </div>
-
-          <div className="mt-4 grid gap-3 md:grid-cols-3">
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-3">
-              <div className="text-xs uppercase text-zinc-500">Actor Type</div>
-              <input
-                value={moderationActorType}
-                onChange={(event) => setModerationActorType(event.target.value)}
-                placeholder="user or bot"
-                className="mt-2 w-full bg-transparent text-sm text-zinc-200 outline-none"
-              />
-            </div>
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-3">
-              <div className="text-xs uppercase text-zinc-500">Content Type</div>
-              <input
-                value={moderationContentType}
-                onChange={(event) => setModerationContentType(event.target.value)}
-                placeholder="message, bounty, bounty_update"
-                className="mt-2 w-full bg-transparent text-sm text-zinc-200 outline-none"
-              />
-            </div>
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-3">
-              <div className="text-xs uppercase text-zinc-500">Actor Id</div>
-              <input
-                value={moderationActorId}
-                onChange={(event) => setModerationActorId(event.target.value)}
-                placeholder="actor id"
-                className="mt-2 w-full bg-transparent text-sm text-zinc-200 outline-none"
-              />
-            </div>
-          </div>
-          <div className="mt-3 grid gap-3 md:grid-cols-3">
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-3">
-              <div className="text-xs uppercase text-zinc-500">Room Id</div>
-              <input
-                value={moderationRoomId}
-                onChange={(event) => {
-                  setModerationRoomId(event.target.value);
-                  loadChannelsForRoom(event.target.value);
-                }}
-                placeholder="room id"
-                className="mt-2 w-full bg-transparent text-sm text-zinc-200 outline-none"
-              />
-              <input
-                value={roomSearch}
-                onChange={(event) => setRoomSearch(event.target.value)}
-                placeholder="Search rooms"
-                className="mt-3 w-full bg-transparent text-xs text-zinc-400 outline-none"
-              />
-              {rooms.length > 0 && (
-                <select
-                  value={moderationRoomId}
-                  onChange={(event) => {
-                    setModerationRoomId(event.target.value);
-                    loadChannelsForRoom(event.target.value);
-                  }}
-                  className="mt-3 w-full bg-zinc-950 text-sm text-zinc-200 outline-none"
-                >
-                  <option value="">Recent rooms...</option>
-                  {filteredRooms.map((room) => (
-                    <option key={room.id} value={room.id}>
-                      {room.title || room.slug} ({room.id}) {room.last_activity_at ? "· active" : ""}
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-3">
-              <div className="text-xs uppercase text-zinc-500">Channel Id</div>
-              <input
-                value={moderationChannelId}
-                onChange={(event) => setModerationChannelId(event.target.value)}
-                placeholder="channel id"
-                className="mt-2 w-full bg-transparent text-sm text-zinc-200 outline-none"
-              />
-              <input
-                value={channelSearch}
-                onChange={(event) => setChannelSearch(event.target.value)}
-                placeholder="Search channels"
-                className="mt-3 w-full bg-transparent text-xs text-zinc-400 outline-none"
-              />
-              {channels.length > 0 && (
-                <select
-                  value={moderationChannelId}
-                  onChange={(event) => setModerationChannelId(event.target.value)}
-                  className="mt-3 w-full bg-zinc-950 text-sm text-zinc-200 outline-none"
-                >
-                  <option value="">Recent channels...</option>
-                  {filteredChannels.map((channel) => (
-                    <option key={channel.id} value={channel.id}>
-                      {channel.title || channel.slug} ({channel.id}) {channel.last_activity_at ? "· active" : ""}
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-            <div className="rounded-none border border-zinc-800 bg-zinc-900/60 p-3">
-              <div className="text-xs uppercase text-zinc-500">Bounty Id</div>
-              <input
-                value={moderationBountyId}
-                onChange={(event) => setModerationBountyId(event.target.value)}
-                placeholder="bounty id"
-                className="mt-2 w-full bg-transparent text-sm text-zinc-200 outline-none"
-              />
-              <input
-                value={bountySearch}
-                onChange={(event) => setBountySearch(event.target.value)}
-                placeholder="Search bounties"
-                className="mt-3 w-full bg-transparent text-xs text-zinc-400 outline-none"
-              />
-              {bounties.length > 0 && (
-                <select
-                  value={moderationBountyId}
-                  onChange={(event) => setModerationBountyId(event.target.value)}
-                  className="mt-3 w-full bg-zinc-950 text-sm text-zinc-200 outline-none"
-                >
-                  <option value="">Recent bounties...</option>
-                  {filteredBounties.map((bounty) => (
-                    <option key={bounty.id} value={bounty.id}>
-                      {bounty.title} ({bounty.id})
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-          </div>
-          <div className="mt-3">
-            <Button
-              onClick={() => loadModeration()}
-              className="rounded-none border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
-              variant="outline"
-            >
-              Apply Filters
-            </Button>
-          </div>
-          {lookupError && (
-            <div className="mt-3 text-xs text-pink-300">
-              {lookupError}
-            </div>
-          )}
-
-          {moderationError && (
-            <div className="mt-4 rounded-none border border-pink-500/40 bg-pink-500/10 p-3 text-xs text-pink-300">
-              {moderationError}
-            </div>
-          )}
-
-          {moderationLoading && (
-            <div className="mt-4 text-xs text-zinc-500">Loading moderation queue...</div>
-          )}
-
-          {!moderationLoading && moderationItems.length === 0 && (
-            <div className="mt-4 text-xs text-zinc-500">No moderation items.</div>
-          )}
-
-          {moderationItems.length > 0 && (
-            <div className="mt-4 space-y-3">
-              {moderationItems.map((item) => (
-                <div
-                  key={item.id}
-                  className="rounded-none border border-zinc-800 bg-zinc-900/60 p-4"
-                >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <div className="text-sm font-semibold">
-                        {item.content_type} · {item.actor_type}:{item.actor_id}
-                      </div>
-                      <div className="mt-1 text-xs text-zinc-400">
-                        {item.reason}
-                      </div>
-                    </div>
-                    <div className="text-xs text-zinc-500">
-                      {item.created_at ? new Date(item.created_at).toLocaleString() : ""}
-                    </div>
-                  </div>
-                  {item.content && (
-                    <div className="mt-3 text-xs text-zinc-300 whitespace-pre-wrap">
-                      {item.content}
-                    </div>
-                  )}
-                  {moderationStatus === "queued" && (
-                    <div className="mt-4 flex items-center gap-2">
-                      <Button
-                        onClick={() => resolveItem(item.id, "resolved")}
-                        className="rounded-none border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10"
-                        variant="outline"
-                      >
-                        Resolve
-                      </Button>
-                      <Button
-                        onClick={() => resolveItem(item.id, "rejected")}
-                        className="rounded-none border border-pink-500 text-pink-300 hover:bg-pink-500/10"
-                        variant="outline"
-                      >
-                        Reject
-                      </Button>
-                      <Button
-                        onClick={async () => {
-                          await api.post(`/admin/moderation/${item.id}/shadow-ban`);
-                          await loadModeration();
-                        }}
-                        className="rounded-none border border-amber-500 text-amber-300 hover:bg-amber-500/10"
-                        variant="outline"
-                      >
-                        Shadow Ban
-                      </Button>
-                      <Button
-                        onClick={async () => {
-                          await api.post(`/admin/moderation/${item.id}/ban`);
-                          await loadModeration();
-                        }}
-                        className="rounded-none border border-red-500 text-red-300 hover:bg-red-500/10"
-                        variant="outline"
-                      >
-                        Ban
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
         </div>
+
+        <StripeSettingsPanel
+          onUpdated={() => {
+            loadOps();
+          }}
+        />
 
         <div className="mt-10 border-t border-zinc-800 pt-6" data-testid="ops-rate-limits">
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs font-mono uppercase tracking-[0.3em] text-zinc-500">Abuse</div>
-              <div className="text-lg font-semibold">Rate Limits</div>
+              <div className="text-lg font-semibold">Rate limit telemetry</div>
+              <div className="mt-1 text-sm text-zinc-400">
+                Review throttled actors and endpoints without leaving the ops surface.
+              </div>
             </div>
             <Button
-              onClick={() => loadRateLimits()}
+              onClick={loadRateLimits}
               className="rounded-none border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
               variant="outline"
             >
@@ -464,12 +182,12 @@ export default function OpsChecklist() {
           </div>
           {!rateLimitAvailable && (
             <div className="mt-3 text-xs text-zinc-500">
-              Rate limit telemetry unavailable (Redis not connected).
+              Rate limit telemetry unavailable. Confirm Redis connectivity first.
             </div>
           )}
           {rateLimitAvailable && rateLimitEvents.length === 0 && (
-            <div className="mt-3 text-xs text-zinc-500">
-              No rate limit events.
+            <div className="mt-3 rounded-none border border-zinc-800 bg-zinc-900/40 p-3 text-xs text-zinc-500">
+              No recent throttling events.
             </div>
           )}
           {rateLimitEvents.length > 0 && (
@@ -495,10 +213,13 @@ export default function OpsChecklist() {
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs font-mono uppercase tracking-[0.3em] text-zinc-500">Alerts</div>
-              <div className="text-lg font-semibold">Security Events</div>
+              <div className="text-lg font-semibold">Security events</div>
+              <div className="mt-1 text-sm text-zinc-400">
+                Keep an eye on platform-level anomalies and admin-visible security signals.
+              </div>
             </div>
             <Button
-              onClick={() => loadAlerts()}
+              onClick={loadAlerts}
               className="rounded-none border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
               variant="outline"
             >
@@ -511,7 +232,9 @@ export default function OpsChecklist() {
             </div>
           )}
           {!alertsError && alerts.length === 0 && (
-            <div className="mt-3 text-xs text-zinc-500">No alerts yet.</div>
+            <div className="mt-3 rounded-none border border-zinc-800 bg-zinc-900/40 p-3 text-xs text-zinc-500">
+              No alerts in the current window.
+            </div>
           )}
           {alerts.length > 0 && (
             <div className="mt-4 space-y-3">
@@ -533,31 +256,3 @@ export default function OpsChecklist() {
     </div>
   );
 }
-  const filteredRooms = rooms.filter((room) => {
-    const term = roomSearch.trim().toLowerCase();
-    if (!term) return true;
-    return (
-      (room.title || "").toLowerCase().includes(term) ||
-      (room.slug || "").toLowerCase().includes(term) ||
-      (room.id || "").toLowerCase().includes(term)
-    );
-  });
-
-  const filteredChannels = channels.filter((channel) => {
-    const term = channelSearch.trim().toLowerCase();
-    if (!term) return true;
-    return (
-      (channel.title || "").toLowerCase().includes(term) ||
-      (channel.slug || "").toLowerCase().includes(term) ||
-      (channel.id || "").toLowerCase().includes(term)
-    );
-  });
-
-  const filteredBounties = bounties.filter((bounty) => {
-    const term = bountySearch.trim().toLowerCase();
-    if (!term) return true;
-    return (
-      (bounty.title || "").toLowerCase().includes(term) ||
-      (bounty.id || "").toLowerCase().includes(term)
-    );
-  });

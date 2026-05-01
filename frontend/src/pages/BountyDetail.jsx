@@ -33,7 +33,27 @@ export default function BountyDetail() {
   }, [setSecondaryPanel]);
 
   useEffect(() => {
-    loadBounty();
+    if (!id) return;
+    let active = true;
+
+    const loadSelectedBounty = async () => {
+      try {
+        const response = await api.get(`/bounties/${id}`);
+        if (!active) return;
+        setBounty(response.data.bounty);
+        setUpdates(response.data.updates || []);
+        setStatus(response.data.bounty.status);
+      } catch (error) {
+        if (active) {
+          toast.error("Unable to load bounty.");
+        }
+      }
+    };
+
+    loadSelectedBounty();
+    return () => {
+      active = false;
+    };
   }, [id]);
 
   const claimBounty = async () => {

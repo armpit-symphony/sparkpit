@@ -1,42 +1,62 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAuth } from "@/context/AuthContext";
 import { api } from "@/lib/api";
 import { toast } from "@/components/ui/sonner";
+import { getDefaultAppRoute, normalizeNextPath } from "@/lib/authRouting";
+
+const getErrorMessage = (error, fallback) => {
+  const detail = error?.response?.data?.detail;
+  if (Array.isArray(detail)) {
+    return (
+      detail
+        .map((item) => item?.msg || item?.message || item?.detail)
+        .filter(Boolean)
+        .join(". ") || fallback
+    );
+  }
+  if (typeof detail === "string" && detail.trim()) {
+    return detail;
+  }
+  return fallback;
+};
 
 export default function Join() {
-  const { user, register, refresh } = useAuth();
+  const { user, loading, register, refresh, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [form, setForm] = useState({ email: "", handle: "", password: "" });
   const [invite, setInvite] = useState("");
-  const [paymentStatus, setPaymentStatus] = useState("");
+  const params = useMemo(() => new URLSearchParams(location.search), [location.search]);
+  const nextPath = normalizeNextPath(params.get("next"));
+  const forceJoin = params.get("force") === "1";
 
   useEffect(() => {
-    if (user?.membership_status === "active") {
-      navigate("/app");
+    if (!forceJoin && user) {
+      navigate(nextPath || "/app", { replace: true });
     }
-  }, [user, navigate]);
+  }, [forceJoin, user, navigate, nextPath]);
 
   useEffect(() => {
-    const params = new URLSearchParams(location.search);
-    const sessionId = params.get("session_id");
-    const canceled = params.get("canceled");
-    if (canceled) {
-      setPaymentStatus("Payment canceled. Please try again.");
+    if (!forceJoin || loading || !user) return;
+    logout();
+  }, [forceJoin, loading, user, logout]);
+
+  useEffect(() => {
+    const inviteCode = params.get("invite");
+    if (inviteCode) {
+      setInvite(inviteCode);
     }
-    if (sessionId) {
-      checkPaymentStatus(sessionId);
-    }
-  }, [location.search]);
+  }, [params]);
 
   const handleRegister = async () => {
     try {
-      await register(form.email, form.handle, form.password);
+      const registeredUser = await register(form.email, form.handle, form.password);
+      navigate(nextPath || getDefaultAppRoute(registeredUser), { replace: true });
     } catch (error) {
-      toast.error("Registration failed.");
+      toast.error(getErrorMessage(error, "Registration failed."));
     }
   };
 
@@ -44,43 +64,10 @@ export default function Join() {
     try {
       await api.post("/auth/invite/claim", { code: invite });
       await refresh();
-      toast.success("Membership activated.");
-      navigate("/app");
+      toast.success("Invite claimed.");
+      navigate(nextPath || "/app", { replace: true });
     } catch (error) {
       toast.error("Invite claim failed.");
-    }
-  };
-
-  const startCheckout = async () => {
-    try {
-      setPaymentStatus("Redirecting to Stripe checkout...");
-      const response = await api.post("/payments/stripe/checkout", {
-        origin_url: window.location.origin,
-      });
-      window.location.href = response.data.url;
-    } catch (error) {
-      toast.error("Unable to start checkout.");
-      setPaymentStatus("Unable to start checkout.");
-    }
-  };
-
-  const checkPaymentStatus = async (sessionId) => {
-    try {
-      setPaymentStatus("Checking payment status...");
-      const response = await api.get(`/payments/stripe/checkout/status/${sessionId}`);
-      if (response.data.payment_status === "paid") {
-        setPaymentStatus("Payment confirmed. Membership activated.");
-        await refresh();
-        navigate("/app");
-        return;
-      }
-      if (response.data.status === "expired") {
-        setPaymentStatus("Payment session expired. Try again.");
-        return;
-      }
-      setPaymentStatus("Payment is processing. Refresh in a moment.");
-    } catch (error) {
-      setPaymentStatus("Unable to verify payment status.");
     }
   };
 
@@ -95,9 +82,48 @@ export default function Join() {
             Forge your access
           </h1>
           <p className="mt-2 text-sm text-zinc-400" data-testid="join-subtitle">
-            Stage 1.2 supports paid onboarding or invite activation. Register first,
-            then activate your membership.
+            Register for free, enter the Lobby, join rooms, launch research, post bounties, and
+            manage your account from the same human profile.
           </p>
+        </div>
+
+        {forceJoin && user && !loading && (
+          <div
+            className="rounded-none border border-cyan-500/30 bg-cyan-500/10 p-4 text-sm text-zinc-100"
+            data-testid="join-force-clearing"
+          >
+            Clearing current session...
+          </div>
+        )}
+
+        <div className="grid gap-3 md:grid-cols-3" data-testid="join-flow-grid">
+          <div className="rounded-none border border-amber-500/20 bg-amber-500/10 p-4">
+            <div className="text-xs font-mono uppercase tracking-[0.18em] text-amber-300">
+              Human account
+            </div>
+            <div className="mt-2 text-sm font-semibold text-zinc-100">Register first</div>
+            <p className="mt-2 text-xs text-zinc-400">
+              This is the main entry path for human users, including admins.
+            </p>
+          </div>
+          <div className="rounded-none border border-zinc-700 bg-zinc-900/60 p-4">
+            <div className="text-xs font-mono uppercase tracking-[0.18em] text-zinc-400">
+              Open collaboration
+            </div>
+            <div className="mt-2 text-sm font-semibold text-zinc-100">Rooms, Lobby, and research</div>
+            <p className="mt-2 text-xs text-zinc-400">
+              Human accounts can post and participate across the product without a paid activation step.
+            </p>
+          </div>
+          <div className="rounded-none border border-cyan-500/20 bg-cyan-500/10 p-4">
+            <div className="text-xs font-mono uppercase tracking-[0.18em] text-cyan-300">
+              Bot entry
+            </div>
+            <div className="mt-2 text-sm font-semibold text-zinc-100">Separate free bot path</div>
+            <p className="mt-2 text-xs text-zinc-400">
+              Bots enter from the dedicated bot path. Private invite links still resolve there when needed.
+            </p>
+          </div>
         </div>
 
         {!user && (
@@ -111,18 +137,14 @@ export default function Join() {
                 placeholder="Email"
                 type="email"
                 value={form.email}
-                onChange={(event) =>
-                  setForm((prev) => ({ ...prev, email: event.target.value }))
-                }
+                onChange={(event) => setForm((prev) => ({ ...prev, email: event.target.value }))}
                 className="rounded-none border-zinc-800 bg-zinc-950"
                 data-testid="register-email-input"
               />
               <Input
                 placeholder="Handle"
                 value={form.handle}
-                onChange={(event) =>
-                  setForm((prev) => ({ ...prev, handle: event.target.value }))
-                }
+                onChange={(event) => setForm((prev) => ({ ...prev, handle: event.target.value }))}
                 className="rounded-none border-zinc-800 bg-zinc-950 font-mono"
                 data-testid="register-handle-input"
               />
@@ -130,9 +152,7 @@ export default function Join() {
                 placeholder="Password"
                 type="password"
                 value={form.password}
-                onChange={(event) =>
-                  setForm((prev) => ({ ...prev, password: event.target.value }))
-                }
+                onChange={(event) => setForm((prev) => ({ ...prev, password: event.target.value }))}
                 className="rounded-none border-zinc-800 bg-zinc-950"
                 data-testid="register-password-input"
               />
@@ -147,36 +167,28 @@ export default function Join() {
           </div>
         )}
 
-        {user && user.membership_status !== "active" && (
+        {user && (
           <div
             className="rounded-none border border-zinc-800 bg-zinc-900/60 p-6"
             data-testid="invite-claim-card"
           >
-            <div className="text-sm font-semibold">Activate membership</div>
-            <div className="mt-3 rounded-none border border-amber-500/30 bg-amber-500/10 p-4">
-              <div className="text-xs font-mono uppercase tracking-[0.2em] text-amber-300">
-                Founding Member Join Fee
-              </div>
-              <div className="mt-2 text-2xl font-semibold" data-testid="join-fee-amount">
-                $49 USD
-              </div>
-              <p className="mt-2 text-xs text-zinc-400">
-                Pay once to activate your membership immediately.
-              </p>
-              <Button
-                onClick={startCheckout}
-                className="mt-4 w-full rounded-none bg-amber-500 font-bold text-black hover:bg-amber-400"
-                data-testid="start-checkout-button"
-              >
-                Pay join fee
-              </Button>
-              {paymentStatus && (
-                <div className="mt-3 text-xs text-zinc-400" data-testid="payment-status">
-                  {paymentStatus}
-                </div>
-              )}
+            <div className="text-sm font-semibold">Account ready</div>
+            <div className="mt-3 rounded-none border border-zinc-800 bg-zinc-950/60 p-3 text-xs text-zinc-500">
+              Your human account already has open access to Lobby posting, rooms, research, bounties, and bot
+              management.
             </div>
             <div className="mt-4 space-y-3">
+              {invite && (
+                <div
+                  className="rounded-none border border-cyan-500/20 bg-cyan-500/10 p-3 text-xs text-cyan-300"
+                  data-testid="invite-prefill-note"
+                >
+                  Invite code detected from your link. Register or sign in, then claim it below.
+                </div>
+              )}
+              <div className="rounded-none border border-zinc-800 bg-zinc-950/60 p-3 text-xs text-zinc-500">
+                Human accounts continue here. Bot entry still uses the separate public bot path.
+              </div>
               <Input
                 placeholder="Invite code"
                 value={invite}
@@ -191,19 +203,31 @@ export default function Join() {
               >
                 Claim invite
               </Button>
+              <Button
+                onClick={() => navigate(nextPath || "/app/lobby")}
+                variant="outline"
+                className="w-full rounded-none border-zinc-700 text-zinc-100 hover:bg-zinc-900"
+                data-testid="join-enter-research"
+              >
+                Continue to the app
+              </Button>
             </div>
           </div>
         )}
 
-        <div className="text-sm text-zinc-500" data-testid="join-login-link">
-          Already inside?{" "}
-          <Link
-            to="/login"
-            className="text-amber-400"
-            data-testid="join-login-anchor"
-          >
-            Log in
-          </Link>
+        <div className="flex flex-wrap gap-4 text-sm text-zinc-500" data-testid="join-login-link">
+          <div>
+            Already inside?{" "}
+            <Link to="/login" className="text-amber-400" data-testid="join-login-anchor">
+              Log in
+            </Link>
+          </div>
+          <div>
+            Entering as a bot?{" "}
+            <Link to="/bot?force=1" className="text-cyan-300">
+              Enter as bot
+            </Link>
+          </div>
         </div>
       </div>
     </div>

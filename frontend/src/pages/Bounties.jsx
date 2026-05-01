@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/sonner";
 import { useAppData } from "@/components/layout/AppShell";
+import { Briefcase, DoorOpen, Radar, SlidersHorizontal } from "lucide-react";
 
 export default function Bounties() {
   const { setSecondaryPanel } = useLayout();
@@ -31,6 +32,12 @@ export default function Bounties() {
     room_id: "",
   });
   const navigate = useNavigate();
+  const hasActiveFilters = Boolean(filters.status || filters.tag || filters.sort !== "newest");
+  const openBountyCount = bounties.filter((bounty) => bounty.status === "open").length;
+  const linkedRoomCount = new Set(
+    bounties.map((bounty) => bounty.room_id).filter(Boolean),
+  ).size;
+  const primaryRoom = rooms[0];
 
   const loadBounties = async () => {
     try {
@@ -52,7 +59,31 @@ export default function Bounties() {
   }, [setSecondaryPanel]);
 
   useEffect(() => {
-    loadBounties();
+    let active = true;
+
+    const loadFilteredBounties = async () => {
+      try {
+        const response = await api.get("/bounties", {
+          params: {
+            status: filters.status || undefined,
+            tag: filters.tag || undefined,
+            sort: filters.sort || undefined,
+          },
+        });
+        if (active) {
+          setBounties(response.data.items || []);
+        }
+      } catch (error) {
+        if (active) {
+          toast.error("Unable to load bounties.");
+        }
+      }
+    };
+
+    loadFilteredBounties();
+    return () => {
+      active = false;
+    };
   }, [filters]);
 
   const createBounty = async () => {
@@ -80,11 +111,194 @@ export default function Bounties() {
     }
   };
 
+  const resetFilters = () => {
+    setFilters({ status: "", tag: "", sort: "newest" });
+  };
+
+  const openRoom = () => {
+    if (primaryRoom?.slug) {
+      navigate(`/app/rooms/${primaryRoom.slug}`);
+      return;
+    }
+    navigate("/app/rooms");
+  };
+
+  const renderEmptyState = () => {
+    if (hasActiveFilters) {
+      return (
+        <div
+          className="rounded-none border border-zinc-800 bg-zinc-900/60 p-6"
+          data-testid="bounties-empty-filtered"
+        >
+          <div className="flex items-start gap-4">
+            <div className="rounded-none border border-zinc-700 bg-zinc-950/90 p-3">
+              <SlidersHorizontal className="h-5 w-5 text-cyan-300" />
+            </div>
+            <div className="max-w-2xl">
+              <div className="text-lg font-semibold text-zinc-100">
+                No bounties are hitting this filter set.
+              </div>
+              <p className="mt-2 text-sm text-zinc-400">
+                Clear the current filters or post a fresh item so the board starts moving again.
+              </p>
+              <div className="mt-5 flex flex-wrap gap-3">
+                <Button
+                  onClick={resetFilters}
+                  variant="outline"
+                  className="rounded-none border-zinc-700 text-zinc-100 hover:bg-zinc-900"
+                  data-testid="bounties-reset-filters"
+                >
+                  Reset filters
+                </Button>
+                <Button
+                  onClick={() => setOpen(true)}
+                  className="rounded-none bg-amber-500 font-bold text-black hover:bg-amber-400"
+                  data-testid="bounties-empty-new-bounty"
+                >
+                  New bounty
+                </Button>
+                <Button
+                  onClick={openRoom}
+                  variant="outline"
+                  className="rounded-none border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/10"
+                  data-testid="bounties-empty-open-room-filtered"
+                >
+                  Open room
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className="rounded-none border border-zinc-800 bg-zinc-900/60 p-6"
+        data-testid="bounties-empty"
+      >
+        <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
+          <div>
+            <div className="flex items-start gap-4">
+              <div className="rounded-none border border-amber-500/30 bg-amber-500/10 p-3">
+                <Briefcase className="h-5 w-5 text-amber-300" />
+              </div>
+              <div className="max-w-2xl">
+                <div className="text-lg font-semibold text-zinc-100">
+                  No bounties are in play yet.
+                </div>
+                <p className="mt-2 text-sm text-zinc-400">
+                  Start the board with the first piece of work, or open a room and shape the brief
+                  before you post it.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-wrap gap-3">
+              <Button
+                onClick={() => setOpen(true)}
+                className="rounded-none bg-amber-500 font-bold text-black hover:bg-amber-400"
+                data-testid="bounties-empty-primary-cta"
+              >
+                New bounty
+              </Button>
+              <Button
+                onClick={openRoom}
+                variant="outline"
+                className="rounded-none border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/10"
+                data-testid="bounties-empty-open-room"
+              >
+                Open room
+              </Button>
+              <Button
+                onClick={() => navigate("/app/activity")}
+                variant="outline"
+                className="rounded-none border-zinc-700 text-zinc-100 hover:bg-zinc-900"
+                data-testid="bounties-empty-activity"
+              >
+                Review activity
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-none border border-zinc-800 bg-zinc-950/70 p-4">
+            <div className="text-xs font-mono uppercase tracking-[0.2em] text-zinc-500">
+              Suggested first steps
+            </div>
+            <div className="mt-4 space-y-3 text-sm text-zinc-300">
+              <div className="flex items-start gap-3">
+                <DoorOpen className="mt-0.5 h-4 w-4 text-cyan-300" />
+                <div>
+                  <div className="font-semibold text-zinc-100">Create or open a room</div>
+                  <div className="text-xs text-zinc-500">
+                    Give the team a place to scope the work and gather context.
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-start gap-3">
+                <Briefcase className="mt-0.5 h-4 w-4 text-amber-300" />
+                <div>
+                  <div className="font-semibold text-zinc-100">Post the first bounty</div>
+                  <div className="text-xs text-zinc-500">
+                    Turn the next concrete task into a visible, claimable unit of work.
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-start gap-3">
+                <Radar className="mt-0.5 h-4 w-4 text-pink-300" />
+                <div>
+                  <div className="font-semibold text-zinc-100">Track the trail</div>
+                  <div className="text-xs text-zinc-500">
+                    Activity and audit views become useful as soon as the first moves land.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="flex h-full flex-col" data-testid="bounties-page">
       <div className="border-b border-zinc-800 bg-zinc-950/70 px-6 py-4">
         <div className="text-xs font-mono uppercase tracking-[0.3em] text-zinc-500">Bounties</div>
-        <div className="mt-2 flex flex-wrap items-center gap-3">
+        <div className="mt-2 flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+          <div>
+            <div className="text-2xl font-semibold text-zinc-100">Mission board</div>
+            <p className="mt-2 max-w-2xl text-sm text-zinc-400">
+              Rooms, bounties, bots, and audit trails for coordinated work.
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="rounded-none border border-zinc-800 bg-zinc-900/50 px-4 py-3">
+              <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">
+                Total
+              </div>
+              <div className="mt-2 text-lg font-semibold text-zinc-100">{bounties.length}</div>
+            </div>
+            <div className="rounded-none border border-zinc-800 bg-zinc-900/50 px-4 py-3">
+              <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">
+                Open
+              </div>
+              <div className="mt-2 text-lg font-semibold text-amber-300">{openBountyCount}</div>
+            </div>
+            <div className="rounded-none border border-zinc-800 bg-zinc-900/50 px-4 py-3">
+              <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">
+                Linked rooms
+              </div>
+              <div className="mt-2 text-lg font-semibold text-cyan-300">{linkedRoomCount}</div>
+            </div>
+            <div className="rounded-none border border-zinc-800 bg-zinc-900/50 px-4 py-3">
+              <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">
+                Rooms ready
+              </div>
+              <div className="mt-2 text-lg font-semibold text-zinc-100">{rooms.length}</div>
+            </div>
+          </div>
+        </div>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
           <select
             value={filters.status}
             onChange={(event) => setFilters((prev) => ({ ...prev, status: event.target.value }))}
@@ -236,11 +450,7 @@ export default function Bounties() {
             </button>
           ))}
         </div>
-        {bounties.length === 0 && (
-          <div className="text-sm text-zinc-500" data-testid="bounties-empty">
-            No bounties match the current filters.
-          </div>
-        )}
+        {bounties.length === 0 && renderEmptyState()}
       </div>
     </div>
   );

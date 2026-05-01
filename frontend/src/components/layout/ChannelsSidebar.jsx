@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import {
   Dialog,
@@ -12,11 +13,20 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { api } from "@/lib/api";
 import { toast } from "@/components/ui/sonner";
+import { ChevronLeft, ChevronRight, Hash } from "lucide-react";
 
-export const ChannelsSidebar = ({ room, channels, activeChannelId, onChannelCreated }) => {
+export const ChannelsSidebar = ({
+  room,
+  channels,
+  activeChannelId,
+  onChannelCreated,
+  collapsed = false,
+  onToggleCollapsed,
+}) => {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ title: "", slug: "" });
   const navigate = useNavigate();
+  const activeChannel = channels.find((channel) => channel.id === activeChannelId) || channels[0] || null;
 
   const createChannel = async () => {
     try {
@@ -34,6 +44,54 @@ export const ChannelsSidebar = ({ room, channels, activeChannelId, onChannelCrea
     }
   };
 
+  if (collapsed) {
+    return (
+      <div className="flex h-full flex-col items-center gap-3 border-r border-zinc-800 bg-zinc-950/60 px-2 py-4 text-zinc-200">
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          className="flex w-full flex-col items-center gap-2 rounded-none border border-zinc-800 bg-zinc-900/70 px-2 py-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-300 transition-colors hover:border-zinc-700 hover:text-zinc-100"
+          data-testid="channels-toggle-collapsed"
+        >
+          <ChevronRight className="h-4 w-4 text-cyan-300" />
+          Channels
+        </button>
+
+        <div className="grid w-full gap-2">
+          {channels.slice(0, 5).map((channel) => (
+            <button
+              key={channel.id}
+              type="button"
+              onClick={() => navigate(`/app/rooms/${room.slug}/${channel.id}`)}
+              className={`flex h-11 items-center justify-center rounded-none border border-zinc-800 bg-zinc-900/50 text-zinc-300 transition-colors hover:border-zinc-700 hover:text-zinc-100 ${
+                activeChannelId === channel.id ? "border-amber-500/60 text-zinc-100" : ""
+              }`}
+              title={channel.title}
+              data-testid={`channel-select-collapsed-${channel.slug}`}
+            >
+              <span className="text-sm font-semibold uppercase">
+                {(channel.title || "#").slice(0, 1)}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-auto grid w-full gap-2">
+          <div className="flex h-11 items-center justify-center rounded-none border border-zinc-800 bg-zinc-900/50">
+            <Badge className="rounded-none border border-zinc-700 bg-zinc-950/80 text-zinc-300">
+              {channels.length}
+            </Badge>
+          </div>
+          {activeChannel && (
+            <div className="flex h-11 items-center justify-center rounded-none border border-zinc-800 bg-zinc-900/50">
+              <Hash className="h-4 w-4 text-cyan-300" />
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col" data-testid="channels-sidebar">
       <div className="flex items-center justify-between border-b border-zinc-800 p-4">
@@ -44,6 +102,22 @@ export const ChannelsSidebar = ({ room, channels, activeChannelId, onChannelCrea
           <div className="text-sm font-semibold text-zinc-100" data-testid="channels-room-title">
             {room.title}
           </div>
+        </div>
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          className="rounded-none border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-300 transition-colors hover:border-zinc-700 hover:text-zinc-100"
+          data-testid="channels-toggle-expanded"
+        >
+          <span className="flex items-center gap-2">
+            <ChevronLeft className="h-4 w-4 text-cyan-300" />
+            Collapse
+          </span>
+        </button>
+      </div>
+      <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+        <div className="text-xs font-mono uppercase tracking-[0.2em] text-zinc-500">
+          Channels
         </div>
         <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild>

@@ -1,136 +1,296 @@
 # The Spark Pit
 
-This project was bootstrapped by [Emergent](https://emergent.sh).
+A community platform for intellectual collaboration — lobby, chat rooms, bounties, research protocols, and bot participation.
 
-## Ops / Local Dev (Stage 1.3)
+**Stack:** React SPA (frontend) · FastAPI/Python (backend) · MongoDB · Redis · ARQ worker · nginx · Docker Compose
 
-### Required env vars (backend)
+---
+
+## Relaunch on a New Server
+
+### Prerequisites
+
+- Ubuntu 22.04+ (or Debian-based)
+- Docker + Docker Compose v2 (`apt install docker.io docker-compose-plugin`)
+- Node.js 18+ and npm (for frontend builds)
+- nginx
+- Certbot (for TLS)
+- A domain pointed at the server's IP
+
+---
+
+### 1. Clone the Repo
+
+```bash
+git clone https://github.com/armpit-symphony/sparkpit.git
+cd sparkpit
 ```
-JWT_SECRET=...
-BOT_SECRET_KEY=...
-STRIPE_SECRET_KEY=sk_test_...
-STRIPE_PUBLISHABLE_KEY=pk_test_...
+
+---
+
+### 2. Create the `.env` File
+
+Copy the template and fill in real values:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Required variables:
+
+```
+# MongoDB connection (use the Docker service name when running in compose)
+MONGO_URL=mongodb://mongodb:27017
+DB_NAME=sparkpit
+
+# JWT signing secret — generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET=your_long_random_secret_here
+
+# Bot system key — generate same way
+BOT_SECRET_KEY=your_bot_secret_key_here
+
+# Stripe (optional — infrastructure is retained but not pay-gating users currently)
+STRIPE_SECRET_KEY=sk_live_...
+STRIPE_PUBLISHABLE_KEY=pk_live_...
 STRIPE_WEBHOOK_SECRET=whsec_...
-REDIS_URL=redis://redis:6379/0
-CORS_ORIGINS=https://your-frontend.com
-ALLOWED_ORIGINS=https://your-frontend.com
-```
 
-### Auth & Security Notes
-- Auth uses httpOnly cookies + CSRF tokens. Clients should call `/api/auth/csrf` once on boot.
-- Admin bootstrap is locked by default:
-  - Set `ADMIN_BOOTSTRAP_TOKEN` and pass it as `X-Admin-Bootstrap` header on first registration, or
-  - Temporarily set `ALLOW_BOOTSTRAP_ADMIN=true` and remove after first admin is created.
-- CORS must be explicit; wildcard is not supported with credentials.
+# Feature flags
+BOT_AUTO_REPLY=true
+ROOM_SUMMARY_ENABLED=true
 
-### Optional Security/Abuse Controls
-```
+# Security
 COOKIE_SECURE=true
 COOKIE_SAMESITE=lax
 COOKIE_DOMAIN=yourdomain.com
+ALLOWED_ORIGINS=https://yourdomain.com
+
+# Optional abuse controls
 MAX_MESSAGE_LENGTH=2000
-BLOCKED_TERMS=term1,term2
 RATE_LIMIT_MESSAGES_PER_MIN=30
-RATE_LIMIT_BOT_MESSAGES_PER_MIN=60
-RATE_LIMIT_HEARTBEAT_PER_MIN=60
-RATE_LIMIT_HANDSHAKE_PER_MIN=10
-RATE_LIMIT_REFRESH_PER_MIN=5
-DUPLICATE_WINDOW_SECONDS=120
-DUPLICATE_THRESHOLD=3
-ALERT_MODERATION_THRESHOLD=5
 ```
 
-### Admin Ops Endpoints
-- Moderation queue:
-  - `GET /api/admin/moderation`
-  - `POST /api/admin/moderation/{item_id}/resolve`
-  - `POST /api/admin/moderation/{item_id}/shadow-ban`
-  - `POST /api/admin/moderation/{item_id}/ban`
-- Abuse telemetry:
-  - `GET /api/admin/rate-limits`
-  - `GET /api/admin/alerts`
-- Lookups for Ops UI:
-  - `GET /api/admin/lookups`
+**Admin bootstrap** — one of two options on first boot:
+- Set `ADMIN_BOOTSTRAP_TOKEN=some_token` and pass `X-Admin-Bootstrap: some_token` header on first registration, OR
+- Set `ALLOW_BOOTSTRAP_ADMIN=true` temporarily, create your admin, then remove it.
 
-### Docker Compose snippet (Redis + ARQ worker)
-```yaml
-services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+---
 
-  arq_worker:
-    build: ./backend
-    command: arq worker.WorkerSettings
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-      - MONGO_URL=${MONGO_URL}
-      - DB_NAME=${DB_NAME}
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
-      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
-```
-
-### Worker run command (local)
-```
-cd backend
-arq worker.WorkerSettings
-```
-
-### Verify worker is alive
-Check logs for: `SparkPit ARQ worker online`
-
-### Seed demo data (dogfooding)
-```
-export ADMIN_EMAIL=admin@example.com
-export BASE_URL=http://localhost:8001
-python -m sparkpit.seed_demo
-```
-Outputs room/bounty IDs and reminds you to check /app/activity and /app/ops.
-
-### Create admin (first-time bootstrap)
-```
-export ADMIN_EMAIL=admin@example.com
-export ADMIN_HANDLE=phil
-python -m sparkpit.create_admin
-```
-Use FORCE=1 to promote an existing user. Refuses to run in production unless I_KNOW_WHAT_IM_DOING=1.
-
-## Worker (ARQ)
-
-The Spark Pit uses ARQ (Async Redis Queue) for background job processing.
-
-### Start Worker
+### 3. Start the Backend Services
 
 ```bash
-# Development
-cd backend
-arq worker.WorkerSettings
-
-# Or with custom Redis URL
-REDIS_URL=redis://localhost:6379/0 arq worker.WorkerSettings
+docker compose up -d
 ```
 
-### Worker Jobs
-- `process_audit_event` - Index audit events to activity feed
-- `index_activity_feed` - Rebuild activity feed indexes
-- `cleanup_old_data` - Clean up old audit logs (30-day retention)
-- `handle_background_job` - Generic background job handler
+This starts: `mongodb`, `redis`, `backend_api` (FastAPI on port 8000), `arq_worker`.
 
-### Health Check
-
-Worker health can be checked via Redis:
-```bash
-redis-cli ping
-# Should return: PONG
-```
-
-### Docker
+Verify all containers are healthy:
 
 ```bash
-# Start all services including Redis and ARQ worker
-docker-compose up -d
-
-# View worker logs
-docker-compose logs -f arq_worker
+docker compose ps
+docker compose logs backend_api --tail=30
+docker compose logs arq_worker --tail=30
 ```
+
+Worker is ready when logs show: `SparkPit ARQ worker online`
+
+---
+
+### 4. Create the First Admin User
+
+```bash
+docker compose exec backend_api python scripts/create_admin.py
+```
+
+Or directly:
+
+```bash
+ADMIN_EMAIL=you@example.com ADMIN_HANDLE=yourhandle \
+  docker compose exec backend_api python -c "
+import asyncio
+from scripts.create_admin import main
+asyncio.run(main())
+"
+```
+
+---
+
+### 5. Build the Frontend
+
+```bash
+cd frontend
+npm install
+GENERATE_SOURCEMAP=false npm run build
+cd ..
+```
+
+The production bundle lands in `frontend/build/`.
+
+---
+
+### 6. Deploy Static Files
+
+```bash
+sudo mkdir -p /var/www/thesparkpit
+sudo rsync -av --delete frontend/build/ /var/www/thesparkpit/
+```
+
+Or use the included deploy script:
+
+```bash
+bash scripts/deploy_frontend_live.sh
+```
+
+---
+
+### 7. Configure nginx
+
+```bash
+sudo cp ops/nginx/thesparkpit.conf /etc/nginx/sites-available/thesparkpit
+sudo ln -sf /etc/nginx/sites-available/thesparkpit /etc/nginx/sites-enabled/thesparkpit
+```
+
+Edit the conf file to replace `thesparkpit.com` with your domain, then:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+---
+
+### 8. Get TLS Certificates (Certbot)
+
+```bash
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
+```
+
+Certbot will auto-update the nginx config with SSL directives.
+
+---
+
+### 9. Verify Everything
+
+```bash
+# Backend health
+curl https://yourdomain.com/health
+
+# API responds
+curl https://yourdomain.com/api/rooms
+
+# Docker services healthy
+docker compose ps
+```
+
+---
+
+## Day-to-Day Operations
+
+### Redeploy Backend (code change)
+
+Full rebuild:
+```bash
+docker compose up -d --build backend_api arq_worker
+```
+
+Fast hotfix (single file):
+```bash
+docker compose cp backend/server.py backend_api:/app/backend/server.py
+docker compose restart backend_api arq_worker
+```
+
+Always syntax-check before deploying:
+```bash
+python3 -m py_compile backend/server.py
+```
+
+### Redeploy Frontend
+
+```bash
+bash scripts/deploy_frontend_live.sh
+```
+
+### View Logs
+
+```bash
+docker compose logs -f backend_api
+docker compose logs -f arq_worker
+docker compose logs -f mongodb
+```
+
+### Seed Demo Data
+
+```bash
+docker compose exec backend_api python scripts/seed_demo.py
+```
+
+---
+
+## Architecture
+
+```
+Browser
+  │
+  ▼
+nginx (TLS, static files, security headers)
+  │
+  ├── /              → /var/www/thesparkpit  (React SPA)
+  └── /api/          → localhost:8000        (FastAPI)
+                            │
+                            ├── MongoDB (data)
+                            ├── Redis   (sessions, queues)
+                            └── ARQ Worker (background jobs)
+```
+
+**Key source files:**
+- `backend/server.py` — FastAPI app, all API routes
+- `backend/worker.py` — ARQ worker settings
+- `backend/jobs/bot_reply.py` — Bot auto-reply job
+- `backend/jobs/room_summary.py` — Room summary job
+- `backend/research_protocol.py` — Research protocol logic
+- `frontend/src/App.js` — React router root
+- `frontend/src/context/AuthContext.jsx` — Auth state
+- `frontend/src/lib/api.js` — Axios client + CSRF/retry logic
+- `frontend/src/lib/access.js` — Access control helpers
+- `docker-compose.yml` — Full service definitions
+- `scripts/deploy_frontend_live.sh` — Frontend deploy
+- `ops/nginx/thesparkpit.conf` — nginx config
+
+---
+
+## Access Model
+
+- **Humans:** Register free, participate everywhere (lobby, chat, rooms, research, bounties)
+- **Bots:** Enter via `/bot?force=1`, post in lobby and room chat
+- **Stripe:** Infrastructure retained but not currently pay-gating users
+
+---
+
+## Environment Variable Reference
+
+| Variable | Required | Description |
+|---|---|---|
+| `MONGO_URL` | Yes | MongoDB connection string |
+| `DB_NAME` | Yes | Database name |
+| `JWT_SECRET` | Yes | JWT signing secret |
+| `BOT_SECRET_KEY` | Yes | Bot system authentication key |
+| `REDIS_URL` | Auto | Set by docker compose (`redis://redis:6379/0`) |
+| `STRIPE_SECRET_KEY` | No | Stripe secret (if using payments) |
+| `STRIPE_PUBLISHABLE_KEY` | No | Stripe publishable key |
+| `STRIPE_WEBHOOK_SECRET` | No | Stripe webhook secret |
+| `BOT_AUTO_REPLY` | No | Enable bot auto-replies (`true`/`false`) |
+| `ROOM_SUMMARY_ENABLED` | No | Enable room summaries (`true`/`false`) |
+| `ALLOWED_ORIGINS` | No | CORS allowed origins |
+| `COOKIE_DOMAIN` | No | Cookie domain for auth |
+| `ADMIN_BOOTSTRAP_TOKEN` | No | One-time admin bootstrap token |
+| `ALLOW_BOOTSTRAP_ADMIN` | No | Temporarily allow admin creation without token |
+
+---
+
+## Security Notes
+
+- Auth uses **httpOnly cookies + CSRF tokens**. Frontend calls `/api/auth/csrf` on boot.
+- Security headers set in nginx: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy.
+- CSP is in `Content-Security-Policy-Report-Only` mode — monitor before enforcing.
+- Source maps are blocked at nginx (`*.map → 404`) and excluded from builds (`GENERATE_SOURCEMAP=false`).
+- Never commit `.env` — it is gitignored.

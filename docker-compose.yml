@@ -19,9 +19,13 @@ services:
     ports:
       - "127.0.0.1:27017:27017"
     volumes:
-      - mongo_data:/data
+      - mongo_db_data:/data/db
+      - mongo_configdb_data:/data/configdb
 
   arq_worker:
+    env_file:
+      - .env
+
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -37,6 +41,9 @@ services:
         condition: service_started
 
   backend_api:
+    env_file:
+      - .env
+
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -56,4 +63,7 @@ services:
 
 volumes:
   redis_data:
-  mongo_data:
+  mongo_db_data:
+    name: thesparkpit_mongo_db_data
+  mongo_configdb_data:
+    name: thesparkpit_mongo_configdb_data

@@ -50,8 +50,30 @@ export default function Activity() {
   }, [setSecondaryPanel]);
 
   useEffect(() => {
-    fetchActivity();
-    const interval = setInterval(fetchActivity, 15000);
+    let active = true;
+
+    const loadActivity = async () => {
+      try {
+        setLoading(true);
+        const response = await api.get("/activity", {
+          params: { room_id: roomFilter || undefined },
+        });
+        if (active) {
+          setEvents(response.data.items || []);
+        }
+      } catch (error) {
+        if (active) {
+          toast.error("Unable to load activity feed.");
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    };
+
+    loadActivity();
+    const interval = setInterval(loadActivity, 15000);
     return () => clearInterval(interval);
   }, [roomFilter]);
 

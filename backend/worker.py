@@ -11,10 +11,19 @@ import contextlib
 import json
 import logging
 import os
+import base64
+import hashlib
+import hmac
+import ipaddress
+import socket
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from motor.motor_asyncio import AsyncIOMotorClient
+from cryptography.fernet import Fernet
 
 # ---- Worker heartbeat (Redis) ----
 HEARTBEAT_KEY = "sparkpit:worker:heartbeat"
@@ -66,6 +75,7 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 MONGO_URL = os.environ.get("MONGO_URL", "mongodb://mongodb:27017")
 DB_NAME = os.environ.get("DB_NAME", "thesparkpit")
+BOT_SECRET_KEY = os.environ.get("BOT_SECRET_KEY")
 
 
 # Data Models
@@ -98,6 +108,7 @@ class WorkerSettings:
         "backend.worker.process_audit_event",
         "backend.worker.index_message",
         "backend.worker.retry_probe",
+        "backend.worker.deliver_bot_webhook",
         "backend.jobs.bot_reply.generate_bot_reply",
         "backend.jobs.room_summary.summarize_room",
         "backend.worker.process_bounty_status",
@@ -277,6 +288,256 @@ async def retry_probe(ctx, payload: Dict[str, Any]) -> Dict[str, Any]:
         "attempt": int(attempt),
         "succeed_on": succeed_on,
         "completed_at": datetime.utcnow().isoformat(),
+    }
+
+
+def get_fernet() -> Fernet:
+    if not BOT_SECRET_KEY:
+        raise RuntimeError("BOT_SECRET_KEY must be set")
+    key = base64.urlsafe_b64encode(hashlib.sha256(BOT_SECRET_KEY.encode()).digest())
+    return Fernet(key)
+
+
+def decrypt_secret(secret_value: str) -> str:
+    return get_fernet().decrypt(secret_value.encode()).decode()
+
+
+def webhook_matches_event(webhook: Dict[str, Any], event_type: str) -> bool:
+    events = webhook.get("events") or []
+    return "*" in events or event_type in events
+
+
+def is_disallowed_webhook_host(hostname: str) -> bool:
+    host = (hostname or "").strip().lower()
+    if not host:
+        return True
+    if host in {"localhost", "mongodb", "redis", "backend_api"}:
+        return True
+    if host.endswith(".local") or host.endswith(".internal"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip:
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    try:
+        records = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return True
+    for record in records:
+        address = record[4][0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return True
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _post_json(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> Dict[str, Any]:
+    request = Request(url=url, data=body, headers=headers, method="POST")
+    with urlopen(request, timeout=timeout) as response:
+        return {"status_code": int(response.status), "body": response.read().decode("utf-8", errors="replace")}
+
+
+async def _update_bot_webhook_delivery_state(db, bot_id: str, webhook_id: str, updates: Dict[str, Any]) -> None:
+    bot = await db.bots.find_one({"id": bot_id}, {"_id": 0, "webhooks": 1})
+    if not bot:
+        return
+    webhooks = list(bot.get("webhooks") or [])
+    changed = False
+    for webhook in webhooks:
+        if webhook.get("id") != webhook_id:
+            continue
+        webhook.update(updates)
+        webhook["updated_at"] = datetime.utcnow().isoformat()
+        changed = True
+        break
+    if changed:
+        await db.bots.update_one(
+            {"id": bot_id},
+            {"$set": {"webhooks": webhooks, "updated_at": datetime.utcnow().isoformat()}},
+        )
+
+
+async def deliver_bot_webhook(ctx, payload: Dict[str, Any]) -> Dict[str, Any]:
+    db = ctx.get("db")
+    if db is None:
+        return {"success": False, "error": "missing db in worker context"}
+
+    bot_id = payload.get("bot_id")
+    webhook_id = payload.get("webhook_id")
+    event_type = payload.get("event_type")
+    event = payload.get("event") or {}
+    delivery_id = payload.get("delivery_id")
+    force_delivery = bool(payload.get("force_delivery"))
+    if not bot_id or not webhook_id or not event_type or not delivery_id:
+        return {"success": False, "error": "missing webhook delivery fields"}
+
+    bot = await db.bots.find_one({"id": bot_id}, {"_id": 0})
+    if not bot:
+        return {"success": False, "error": "bot not found", "bot_id": bot_id}
+
+    webhook = next((item for item in bot.get("webhooks") or [] if item.get("id") == webhook_id), None)
+    if not webhook:
+        return {"success": False, "error": "webhook not found", "webhook_id": webhook_id}
+    if not webhook.get("enabled", True) and not force_delivery:
+        return {"success": False, "error": "webhook not found or disabled", "webhook_id": webhook_id}
+    if not force_delivery and not webhook_matches_event(webhook, event_type):
+        return {"success": False, "error": "event not subscribed", "webhook_id": webhook_id}
+
+    parsed = urlparse(webhook.get("url") or "")
+    if parsed.scheme != "https" or not parsed.hostname or is_disallowed_webhook_host(parsed.hostname):
+        await _update_bot_webhook_delivery_state(
+            db,
+            bot_id,
+            webhook_id,
+            {
+                "last_delivery_status": "blocked",
+                "last_delivery_at": datetime.utcnow().isoformat(),
+                "last_error": "webhook host blocked",
+                "last_http_status": None,
+                "last_event_type": event_type,
+                "last_delivery_id": delivery_id,
+            },
+        )
+        return {"success": False, "error": "webhook host blocked", "webhook_id": webhook_id}
+
+    timestamp = str(int(time.time()))
+    body = json.dumps(
+        {
+            "delivery_id": delivery_id,
+            "event_type": event_type,
+            "bot_id": bot_id,
+            "webhook_id": webhook_id,
+            "timestamp": timestamp,
+            "event": event,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signing_secret = decrypt_secret(webhook["signing_secret_encrypted"])
+    signed_payload = f"{timestamp}.".encode("utf-8") + body
+    signature = hmac.new(signing_secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "SparkPit-BotWebhook/1.0",
+        "X-SparkPit-Event": event_type,
+        "X-SparkPit-Bot-Id": bot_id,
+        "X-SparkPit-Webhook-Id": webhook_id,
+        "X-SparkPit-Delivery-Id": delivery_id,
+        "X-SparkPit-Timestamp": timestamp,
+        "X-SparkPit-Signature-256": f"sha256={signature}",
+    }
+
+    try:
+        response = await asyncio.to_thread(_post_json, webhook["url"], body, headers, 10)
+        status_code = int(response["status_code"])
+    except HTTPError as error:
+        status_code = int(getattr(error, "code", 0) or 0)
+        if status_code >= 500:
+            attempt = int(ctx.get("job_try", 1))
+            defer_seconds = min(300, 2 ** min(attempt, 8))
+            await _update_bot_webhook_delivery_state(
+                db,
+                bot_id,
+                webhook_id,
+                {
+                    "last_delivery_status": "retrying",
+                    "last_delivery_at": datetime.utcnow().isoformat(),
+                    "last_error": f"server responded {status_code}",
+                    "last_http_status": status_code,
+                    "last_event_type": event_type,
+                    "last_delivery_id": delivery_id,
+                },
+            )
+            raise Retry(defer=defer_seconds) from error
+        await _update_bot_webhook_delivery_state(
+            db,
+            bot_id,
+            webhook_id,
+            {
+                "last_delivery_status": "failed",
+                "last_delivery_at": datetime.utcnow().isoformat(),
+                "last_error": f"server responded {status_code or 'error'}",
+                "last_http_status": status_code or None,
+                "last_event_type": event_type,
+                "last_delivery_id": delivery_id,
+            },
+        )
+        return {
+            "success": False,
+            "bot_id": bot_id,
+            "webhook_id": webhook_id,
+            "delivery_id": delivery_id,
+            "status_code": status_code or None,
+        }
+    except (URLError, TimeoutError, OSError) as error:
+        attempt = int(ctx.get("job_try", 1))
+        defer_seconds = min(300, 2 ** min(attempt, 8))
+        await _update_bot_webhook_delivery_state(
+            db,
+            bot_id,
+            webhook_id,
+            {
+                "last_delivery_status": "retrying",
+                "last_delivery_at": datetime.utcnow().isoformat(),
+                "last_error": str(error)[:280],
+                "last_http_status": None,
+                "last_event_type": event_type,
+                "last_delivery_id": delivery_id,
+            },
+        )
+        raise Retry(defer=defer_seconds) from error
+
+    if status_code >= 500:
+        attempt = int(ctx.get("job_try", 1))
+        defer_seconds = min(300, 2 ** min(attempt, 8))
+        await _update_bot_webhook_delivery_state(
+            db,
+            bot_id,
+            webhook_id,
+            {
+                "last_delivery_status": "retrying",
+                "last_delivery_at": datetime.utcnow().isoformat(),
+                "last_error": f"server responded {status_code}",
+                "last_http_status": status_code,
+                "last_event_type": event_type,
+                "last_delivery_id": delivery_id,
+            },
+        )
+        raise Retry(defer=defer_seconds)
+
+    updates = {
+        "last_delivery_status": "delivered" if 200 <= status_code < 300 else "failed",
+        "last_delivery_at": datetime.utcnow().isoformat(),
+        "last_error": None if 200 <= status_code < 300 else f"server responded {status_code}",
+        "last_http_status": status_code,
+        "last_event_type": event_type,
+        "last_delivery_id": delivery_id,
+    }
+    await _update_bot_webhook_delivery_state(db, bot_id, webhook_id, updates)
+    return {
+        "success": 200 <= status_code < 300,
+        "bot_id": bot_id,
+        "webhook_id": webhook_id,
+        "delivery_id": delivery_id,
+        "status_code": status_code,
     }
 
 

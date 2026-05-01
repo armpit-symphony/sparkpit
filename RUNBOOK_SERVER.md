@@ -55,6 +55,23 @@ There are three possible run modes:
 ## Deploy Frontend (safe/reversible)
 Use this when nginx is serving stale UI from `/var/www/thesparkpit`.
 
+Preferred path:
+
+```bash
+cd /home/ubuntu/thesparkpit || exit 1
+bash scripts/deploy_frontend_live.sh
+```
+
+What it does:
+- builds the frontend
+- runs `scripts/verify_frontend_bundle.sh`
+- backs up `/var/www/thesparkpit`
+- syncs `frontend/build/` into `/var/www/thesparkpit`
+- verifies deployed bundle hash matches built hash
+- verifies nginx serves the same hash on `https://127.0.0.1/` with `Host: thesparkpit.com`
+
+If you need to run the same flow manually, use the steps below.
+
 ```bash
 cd /home/ubuntu/thesparkpit || exit 1
 
@@ -64,6 +81,9 @@ curl -k -sS https://127.0.0.1/ -H 'Host: thesparkpit.com' | rg -o 'static/js/mai
 
 # 2) build frontend from repo
 cd frontend && npm ci && npm run build && cd ..
+
+# 2a) fail early if the built bundle contains broken /undefined/api references
+bash scripts/verify_frontend_bundle.sh
 
 # 3) backup deployed web root (timestamped)
 sudo rsync -a --delete /var/www/thesparkpit/ /var/www/thesparkpit.bak.$(date +%Y%m%d-%H%M%S)/
@@ -78,6 +98,7 @@ curl -k -sS https://127.0.0.1/ -H 'Host: thesparkpit.com' | rg -o 'static/js/mai
 
 Pass condition:
 - `SERVING_AFTER` shows the newly built hash.
+- `scripts/verify_frontend_bundle.sh` passes before sync.
 - Optional strong check:
   - `sha256sum frontend/build/static/js/main.*.js`
   - `sha256sum /var/www/thesparkpit/static/js/main.*.js`
